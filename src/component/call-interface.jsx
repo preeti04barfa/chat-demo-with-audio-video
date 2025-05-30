@@ -1,3 +1,5 @@
+"use client"
+
 import { useEffect, useRef, useState } from "react"
 import { PhoneOff, Mic, MicOff, Video, VideoOff } from "lucide-react"
 
@@ -74,11 +76,9 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       await handleIceCandidate(from, candidate)
     })
 
-    //track state change handling
     socket.on("FE-track-state-changed", ({ from, trackType, enabled }) => {
       console.log(`Track state changed from ${from}: ${trackType} = ${enabled}`)
 
-      //remote user state
       setRemoteUserStates((prev) => ({
         ...prev,
         [from]: {
@@ -87,11 +87,11 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         },
       }))
 
-      // If this is an audio track, mute/unmute the audio element
-      if (trackType === "audio" && remoteVideosRef.current[from]) {
-        const videoElement = remoteVideosRef.current[from]
-        if (videoElement && videoElement.srcObject) {
-          const audioTracks = videoElement.srcObject.getAudioTracks()
+      // Handle audio track muting more reliably
+      if (trackType === "audio") {
+        const remoteStream = remoteStreams[from]
+        if (remoteStream) {
+          const audioTracks = remoteStream.getAudioTracks()
           audioTracks.forEach((track) => {
             track.enabled = enabled
             console.log(`Remote audio track ${enabled ? "enabled" : "disabled"} for ${from}`)
@@ -108,25 +108,36 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       socket.off("FE-webrtc-ice-candidate")
       socket.off("FE-track-state-changed")
     }
-  }, [socket])
+  }, [socket, remoteStreams])
 
   const initializeCall = async () => {
     try {
+      // Improved audio constraints for better quality
+      const audioConstraints = {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        sampleRate: 48000,
+        channelCount: 1,
+        volume: 1.0,
+        latency: 0.01,
+      }
+
+      // Optimized video constraints to reduce bandwidth and improve stability
+      const videoConstraints =
+        call.callType === "video"
+          ? {
+              width: { ideal: 480, max: 640 },
+              height: { ideal: 360, max: 480 },
+              facingMode: "user",
+              frameRate: { ideal: 15, max: 24 },
+              aspectRatio: 4 / 3,
+            }
+          : false
+
       const constraints = {
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-        video:
-          call.callType === "video"
-            ? {
-                width: { ideal: 640, max: 1280 },
-                height: { ideal: 480, max: 720 },
-                facingMode: "user",
-                frameRate: { ideal: 30, max: 30 },
-              }
-            : false,
+        audio: audioConstraints,
+        video: videoConstraints,
       }
 
       console.log("Requesting media with constraints:", constraints)
@@ -137,6 +148,9 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream
         localVideoRef.current.muted = true
+        // Ensure video plays smoothly
+        localVideoRef.current.playsInline = true
+        localVideoRef.current.autoplay = true
       }
 
       // Join the call room
@@ -155,7 +169,11 @@ export function CallInterface({ call, user, socket, onEndCall }) {
             video: call.callType === "video",
           },
         })
-        createPeerConnection(otherUserId)
+
+        // Add a small delay to ensure everything is properly initialized
+        setTimeout(() => {
+          createPeerConnection(otherUserId)
+        }, 100)
       }
     } catch (error) {
       console.error("Error accessing media devices:", error)
@@ -173,11 +191,13 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
       console.log(`Creating peer connection for user ${userId}`)
 
+      // Enhanced STUN/TURN configuration for better connectivity
       const configuration = {
         iceServers: [
           { urls: "stun:stun.l.google.com:19302" },
           { urls: "stun:stun1.l.google.com:19302" },
           { urls: "stun:stun2.l.google.com:19302" },
+          { urls: "stun:stun3.l.google.com:19302" },
           {
             urls: "turn:numb.viagenie.ca",
             credential: "muazkh",
@@ -185,6 +205,8 @@ export function CallInterface({ call, user, socket, onEndCall }) {
           },
         ],
         iceCandidatePoolSize: 10,
+        bundlePolicy: "balanced",
+        rtcpMuxPolicy: "require",
       }
 
       const peerConnection = new RTCPeerConnection(configuration)
@@ -196,39 +218,122 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         remoteDescriptionSet: false,
       }
 
-      // Add local tracks to the peer connection and store senders
+      // Add local tracks with optimized settings
       if (localStreamRef.current) {
         audioSendersRef.current[userId] = []
 
         localStreamRef.current.getTracks().forEach((track) => {
           console.log(`Adding ${track.kind} track to peer connection for ${userId}`)
+
+          // Configure track settings for better quality
+          if (track.kind === "audio") {
+            // Audio track optimizations
+            track
+              .applyConstraints({
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+                sampleRate: 48000,
+              })
+              .catch(console.warn)
+          } else if (track.kind === "video") {
+            // Video track optimizations
+            track
+              .applyConstraints({
+                width: { ideal: 480 },
+                height: { ideal: 360 },
+                frameRate: { ideal: 15 },
+              })
+              .catch(console.warn)
+          }
+
           const sender = peerConnection.addTrack(track, localStreamRef.current)
 
           // Store audio senders for mute functionality
           if (track.kind === "audio") {
             audioSendersRef.current[userId].push(sender)
           }
+
+          // Configure sender parameters for better quality
+          if (sender.getParameters) {
+            const params = sender.getParameters()
+            if (params.encodings && params.encodings.length > 0) {
+              if (track.kind === "video") {
+                // Video encoding optimizations
+                params.encodings[0].maxBitrate = 500000 // 500 kbps max
+                params.encodings[0].scaleResolutionDownBy = 1
+                params.encodings[0].maxFramerate = 15
+              } else if (track.kind === "audio") {
+                // Audio encoding optimizations
+                params.encodings[0].maxBitrate = 64000 // 64 kbps for audio
+                params.encodings[0].priority = "high"
+              }
+              sender.setParameters(params).catch(console.warn)
+            }
+          }
         })
       }
 
-      // Handle incoming tracks
+      // Handle incoming tracks with improved stability and timing
       peerConnection.ontrack = (event) => {
         console.log(`Received ${event.track.kind} track from ${userId}`)
 
         const [remoteStream] = event.streams
 
-        setRemoteStreams((prev) => ({
-          ...prev,
-          [userId]: remoteStream,
-        }))
+        // Immediately update the remote streams state
+        setRemoteStreams((prev) => {
+          const newStreams = { ...prev }
+          newStreams[userId] = remoteStream
+          return newStreams
+        })
 
-        // Set the stream for video element immediately
-        if (remoteVideosRef.current[userId]) {
-          remoteVideosRef.current[userId].srcObject = remoteStream
-          // audio is not muted for remote streams
-          remoteVideosRef.current[userId].muted = false
-          remoteVideosRef.current[userId].volume = 1.0
+        // Set up video element immediately without timeout
+        const setupVideoElement = () => {
+          if (remoteVideosRef.current[userId] && remoteStream) {
+            const videoElement = remoteVideosRef.current[userId]
+
+            // Clear any existing stream first
+            if (videoElement.srcObject) {
+              videoElement.srcObject = null
+            }
+
+            videoElement.srcObject = remoteStream
+            videoElement.muted = false
+            videoElement.volume = 1.0
+            videoElement.playsInline = true
+            videoElement.autoplay = true
+
+            // Force play immediately
+            const playVideo = async () => {
+              try {
+                await videoElement.play()
+                console.log(`Remote video playing for ${userId}`)
+              } catch (error) {
+                console.error("Error playing remote video:", error)
+                // Retry after a short delay
+                setTimeout(() => {
+                  videoElement.play().catch(console.error)
+                }, 100)
+              }
+            }
+
+            // Handle different loading states
+            if (videoElement.readyState >= 2) {
+              // Video is already loaded enough to play
+              playVideo()
+            } else {
+              videoElement.onloadeddata = playVideo
+              videoElement.oncanplay = playVideo
+            }
+          }
         }
+
+        // Try to setup immediately and also retry
+        setupVideoElement()
+
+        // Also retry after a short delay to handle timing issues
+        setTimeout(setupVideoElement, 50)
+        setTimeout(setupVideoElement, 200)
 
         // Handle track state changes
         event.track.onmute = () => {
@@ -251,6 +356,11 @@ export function CallInterface({ call, user, socket, onEndCall }) {
               [event.track.kind]: true,
             },
           }))
+        }
+
+        // Handle track ended
+        event.track.onended = () => {
+          console.log(`Track ${event.track.kind} ended from ${userId}`)
         }
       }
 
@@ -275,6 +385,10 @@ export function CallInterface({ call, user, socket, onEndCall }) {
           peerConnection.iceConnectionState === "disconnected"
         ) {
           console.warn(`ICE connection with ${userId} is ${peerConnection.iceConnectionState}`)
+          // Attempt to restart ICE
+          if (peerConnection.iceConnectionState === "failed") {
+            peerConnection.restartIce()
+          }
         }
       }
 
@@ -284,6 +398,8 @@ export function CallInterface({ call, user, socket, onEndCall }) {
           const offer = await peerConnection.createOffer({
             offerToReceiveAudio: true,
             offerToReceiveVideo: call.callType === "video",
+            voiceActivityDetection: true,
+            iceRestart: false,
           })
 
           await peerConnection.setLocalDescription(offer)
@@ -338,7 +454,9 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       }
 
       // Create and send answer
-      const answer = await peerConnection.createAnswer()
+      const answer = await peerConnection.createAnswer({
+        voiceActivityDetection: true,
+      })
       await peerConnection.setLocalDescription(answer)
 
       socket.emit("BE-webrtc-answer", {
@@ -410,7 +528,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     }
   }
 
-  // mute functionality
+  // Improved mute functionality
   const toggleAudio = () => {
     if (!localStreamRef.current) return
 
@@ -418,14 +536,14 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     console.log(`Toggling audio to ${newAudioState ? "unmuted" : "muted"}`)
 
     try {
-      // Method 1: Toggle audio tracks in local stream
+      // Toggle audio tracks in local stream
       const audioTracks = localStreamRef.current.getAudioTracks()
       audioTracks.forEach((track) => {
         track.enabled = newAudioState
         console.log(`Set local audio track.enabled = ${track.enabled}`)
       })
 
-      //silent audio track if muting
+      // Update sender tracks
       Object.keys(peerConnectionsRef.current).forEach((userId) => {
         const senders = audioSendersRef.current[userId]
         if (senders && senders.length > 0) {
@@ -513,7 +631,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`
   }
 
-  // remote video rendering with mute handling
+  // Improved remote video rendering with better first-time handling
   const renderRemoteVideos = () => {
     return Object.keys(remoteStreams).map((userId) => {
       const userState = remoteUserStates[userId] || { audio: true, video: true }
@@ -525,39 +643,61 @@ export function CallInterface({ call, user, socket, onEndCall }) {
             ref={(el) => {
               if (el) {
                 remoteVideosRef.current[userId] = el
-                if (remoteStreams[userId]) {
-                  el.srcObject = remoteStreams[userId]
+                const stream = remoteStreams[userId]
 
-                  // audio is properly set based on mute state
-                  el.muted = false
-                  el.volume = 1.0
+                if (stream) {
+                  // Force update the video element
+                  const updateVideoElement = () => {
+                    if (el.srcObject !== stream) {
+                      el.srcObject = stream
+                      el.muted = false
+                      el.volume = 1.0
+                      el.playsInline = true
+                      el.autoplay = true
 
-                  // Apply audio state from remote user
-                  if (remoteStreams[userId].getAudioTracks().length > 0) {
-                    remoteStreams[userId].getAudioTracks().forEach((track) => {
-                      track.enabled = userState.audio
-                      console.log(`Set remote audio track.enabled = ${track.enabled} for ${userId}`)
-                    })
+                      // Immediate play attempt
+                      const attemptPlay = async () => {
+                        try {
+                          await el.play()
+                          console.log(`Remote video started playing for ${userId}`)
+                        } catch (error) {
+                          console.error("Play failed, retrying:", error)
+                          setTimeout(() => el.play().catch(console.error), 100)
+                        }
+                      }
+
+                      if (el.readyState >= 2) {
+                        attemptPlay()
+                      } else {
+                        el.onloadeddata = attemptPlay
+                        el.oncanplay = attemptPlay
+                      }
+
+                      // Apply audio state
+                      if (stream.getAudioTracks().length > 0) {
+                        stream.getAudioTracks().forEach((track) => {
+                          track.enabled = userState.audio
+                        })
+                      }
+                    }
                   }
 
-                  // Auto play the video
-                  el.play().catch((error) => {
-                    console.error("Error auto-playing video:", error)
-                    // Try again with user interaction
-                    document.addEventListener(
-                      "click",
-                      () => {
-                        el.play().catch(console.error)
-                      },
-                      { once: true },
-                    )
-                  })
+                  updateVideoElement()
+
+                  // Also update when stream changes
+                  setTimeout(updateVideoElement, 50)
                 }
               }
             }}
             autoPlay
             playsInline
-            className={`w-full h-full object-cover ${call.callType === "audio" || !userState.video ? "hidden" : ""}`}
+            className={`w-full h-full object-cover transition-opacity duration-200 ${
+              call.callType === "audio" || !userState.video ? "hidden" : ""
+            }`}
+            style={{
+              backgroundColor: "#1f2937",
+              minHeight: "200px",
+            }}
           />
           {(call.callType === "audio" || !userState.video) && (
             <div className="absolute inset-0 flex items-center justify-center bg-gray-800">
@@ -610,7 +750,9 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
           {/* Local video */}
           <div
-            className={`relative rounded-lg overflow-hidden bg-gray-800 ${Object.keys(remoteStreams).length > 0 ? "md:col-span-1" : "w-full h-full"}`}
+            className={`relative rounded-lg overflow-hidden bg-gray-800 ${
+              Object.keys(remoteStreams).length > 0 ? "md:col-span-1" : "w-full h-full"
+            }`}
           >
             <video
               ref={localVideoRef}
@@ -618,6 +760,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
               playsInline
               muted
               className={`w-full h-full object-cover ${call.callType === "audio" || !isVideoEnabled ? "hidden" : ""}`}
+              style={{ backgroundColor: "#1f2937" }}
             />
             {(call.callType === "audio" || !isVideoEnabled) && (
               <div className="absolute inset-0 flex items-center justify-center bg-gray-800">
