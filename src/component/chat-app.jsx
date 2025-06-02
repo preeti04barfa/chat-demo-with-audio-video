@@ -31,6 +31,7 @@ export default function ChatApp({ socket, user }) {
   const [callHistory, setCallHistory] = useState([])
   const [showCallHistory, setShowCallHistory] = useState(false)
   const [callEngagedMessage, setCallEngagedMessage] = useState(null)
+  const [activeGroupCalls, setActiveGroupCalls] = useState({}) // Track active group calls
 
   // Audio elements for ring tones
   const [ringAudio, setRingAudio] = useState(null)
@@ -172,7 +173,7 @@ export default function ChatApp({ socket, user }) {
     socket.on("FE-group-created", ({ group }) => {
       console.log("Group created:", group)
       setIsCreatingGroup(false)
-      requestGroupList()
+      setGroups((prev) => [...prev, group])
     })
 
     // Private chat events
@@ -183,9 +184,7 @@ export default function ChatApp({ socket, user }) {
       setCurrentGroup(null)
       setIsGroupChat(false)
 
-      // Join the socket room
       socket.emit("BE-join-room", { roomId })
-
       socket.emit("BE-get-chat-history", { roomId })
     })
 
@@ -208,9 +207,7 @@ export default function ChatApp({ socket, user }) {
       setCurrentChatUser(null)
       setIsGroupChat(true)
 
-      // Join the socket room
       socket.emit("BE-join-room", { roomId: groupId })
-
       socket.emit("BE-get-group-history", { groupId })
     })
 
@@ -241,14 +238,13 @@ export default function ChatApp({ socket, user }) {
       }))
     })
 
-    // Call events
+    // Enhanced call events
     socket.on("FE-incoming-call", (callData) => {
       console.log("Incoming call:", callData)
 
       // If already in a call, don't show the incoming call notification
       if (isInCall || currentCall || incomingCall || outgoingCall) {
         console.log("Already in a call, ignoring incoming call")
-        // Automatically reject the call
         socket.emit("BE-reject-call", {
           callId: callData.callId,
           reason: "busy",
@@ -256,8 +252,8 @@ export default function ChatApp({ socket, user }) {
         return
       }
 
-      // Play ring sound with better error handling
-      if (ringAudio) {
+      // Play ring sound only if call is still ringing
+      if (callData.status === "ringing" && ringAudio) {
         try {
           if (ringAudio.currentTime !== undefined) {
             ringAudio.currentTime = 0
@@ -274,6 +270,31 @@ export default function ChatApp({ socket, user }) {
       }
 
       setIncomingCall(callData)
+    })
+
+    // NEW: Handle call status updates
+    socket.on("FE-call-status-changed", ({ callId, status, groupId, callType }) => {
+      console.log("Call status changed:", { callId, status, groupId, callType })
+
+      if (groupId) {
+        setActiveGroupCalls((prev) => ({
+          ...prev,
+          [groupId]: { callId, status, callType: callType || "audio" }, // Use the actual call type
+        }))
+      }
+
+      // Stop ringing when call becomes active
+      if (status === "active" && ringAudio && ringAudio.pause) {
+        ringAudio.pause()
+        if (ringAudio.currentTime !== undefined) {
+          ringAudio.currentTime = 0
+        }
+      }
+
+      // Update incoming call status
+      if (incomingCall && incomingCall.callId === callId) {
+        setIncomingCall((prev) => ({ ...prev, status }))
+      }
     })
 
     socket.on("FE-call-accepted", ({ callId, acceptedBy, isGroupCall }) => {
@@ -298,15 +319,12 @@ export default function ChatApp({ socket, user }) {
         setIsInCall(true)
       }
 
-      // Refresh call history
       requestCallHistory()
     })
 
-    // NEW: Handle call engaged response
     socket.on("FE-call-engaged", ({ callId, userId, userName }) => {
       console.log("Call engaged:", { callId, userId, userName })
 
-      // Stop ring sound
       if (ringAudio && ringAudio.pause) {
         ringAudio.pause()
         if (ringAudio.currentTime !== undefined) {
@@ -314,30 +332,25 @@ export default function ChatApp({ socket, user }) {
         }
       }
 
-      // Show call engaged message
       if (outgoingCall && outgoingCall.callId === callId) {
         setCallEngagedMessage({
           userName,
           timestamp: new Date(),
         })
 
-        // Clear outgoing call
         setOutgoingCall(null)
 
-        // Auto-dismiss after 3 seconds
         setTimeout(() => {
           setCallEngagedMessage(null)
         }, 3000)
       }
 
-      // Refresh call history
       requestCallHistory()
     })
 
     socket.on("FE-call-rejected", ({ callId, rejectedBy, isGroupCall, reason }) => {
       console.log("Call rejected:", { callId, rejectedBy, isGroupCall, reason })
 
-      // Stop ring sound
       if (ringAudio && ringAudio.pause) {
         ringAudio.pause()
         if (ringAudio.currentTime !== undefined) {
@@ -345,21 +358,17 @@ export default function ChatApp({ socket, user }) {
         }
       }
 
-      // Handle rejection for incoming call
       if (incomingCall?.callId === callId) {
         setIncomingCall(null)
       }
 
-      // Handle rejection for outgoing call
       if (outgoingCall?.callId === callId) {
         if (reason === "busy") {
-          // Show call engaged message
           setCallEngagedMessage({
             userName: rejectedBy.name,
             timestamp: new Date(),
           })
 
-          // Auto-dismiss after 3 seconds
           setTimeout(() => {
             setCallEngagedMessage(null)
           }, 3000)
@@ -369,19 +378,26 @@ export default function ChatApp({ socket, user }) {
         setOutgoingCall(null)
       }
 
-      // Refresh call history
       requestCallHistory()
     })
 
-    socket.on("FE-call-ended", ({ callId }) => {
-      console.log("Call ended:", callId)
+    socket.on("FE-call-ended", ({ callId, groupId }) => {
+      console.log("Call ended:", { callId, groupId })
 
-      // Stop ring sound
       if (ringAudio && ringAudio.pause) {
         ringAudio.pause()
         if (ringAudio.currentTime !== undefined) {
           ringAudio.currentTime = 0
         }
+      }
+
+      // Clear group call status
+      if (groupId) {
+        setActiveGroupCalls((prev) => {
+          const updated = { ...prev }
+          delete updated[groupId]
+          return updated
+        })
       }
 
       // Clear all call states
@@ -390,7 +406,6 @@ export default function ChatApp({ socket, user }) {
       setCurrentCall(null)
       setIsInCall(false)
 
-      // Refresh call history
       requestCallHistory()
     })
 
@@ -420,6 +435,7 @@ export default function ChatApp({ socket, user }) {
       socket.off("FE-chat-history")
       socket.off("FE-group-history")
       socket.off("FE-incoming-call")
+      socket.off("FE-call-status-changed")
       socket.off("FE-call-accepted")
       socket.off("FE-call-rejected")
       socket.off("FE-call-engaged")
@@ -457,12 +473,6 @@ export default function ChatApp({ socket, user }) {
         })
       }
       setMessage("")
-    } else {
-      console.log("Cannot send message:", {
-        messageEmpty: !message.trim(),
-        noRoomId: !currentRoomId,
-        socketNotConnected: !socket?.connected,
-      })
     }
   }
 
@@ -502,7 +512,6 @@ export default function ChatApp({ socket, user }) {
 
   const handleVideoCall = () => {
     if (currentChatUser && socket && socket.connected) {
-      // Check if the user is already in a call
       if (isInCall || currentCall || incomingCall || outgoingCall) {
         alert("You are already in a call. Please end the current call before starting a new one.")
         return
@@ -523,10 +532,8 @@ export default function ChatApp({ socket, user }) {
         targetUserId: currentChatUser._id,
       })
 
-      // Show outgoing call UI to caller
       setOutgoingCall(callData)
 
-      // Play ring sound for caller
       if (ringAudio) {
         try {
           if (ringAudio.currentTime !== undefined) {
@@ -545,7 +552,6 @@ export default function ChatApp({ socket, user }) {
 
   const handleAudioCall = () => {
     if (currentChatUser && socket && socket.connected) {
-      // Check if the user is already in a call
       if (isInCall || currentCall || incomingCall || outgoingCall) {
         alert("You are already in a call. Please end the current call before starting a new one.")
         return
@@ -566,10 +572,8 @@ export default function ChatApp({ socket, user }) {
         targetUserId: currentChatUser._id,
       })
 
-      // Show outgoing call UI to caller
       setOutgoingCall(callData)
 
-      // Play ring sound for caller
       if (ringAudio) {
         try {
           if (ringAudio.currentTime !== undefined) {
@@ -588,7 +592,6 @@ export default function ChatApp({ socket, user }) {
 
   const handleGroupVideoCall = () => {
     if (currentGroup && socket && socket.connected) {
-      // Check if the user is already in a call
       if (isInCall || currentCall || incomingCall || outgoingCall) {
         alert("You are already in a call. Please end the current call before starting a new one.")
         return
@@ -609,10 +612,8 @@ export default function ChatApp({ socket, user }) {
         groupId: currentGroup._id,
       })
 
-      // Show outgoing call UI to caller
       setOutgoingCall(callData)
 
-      // Play ring sound for caller
       if (ringAudio) {
         try {
           if (ringAudio.currentTime !== undefined) {
@@ -631,7 +632,6 @@ export default function ChatApp({ socket, user }) {
 
   const handleGroupAudioCall = () => {
     if (currentGroup && socket && socket.connected) {
-      // Check if the user is already in a call
       if (isInCall || currentCall || incomingCall || outgoingCall) {
         alert("You are already in a call. Please end the current call before starting a new one.")
         return
@@ -652,10 +652,8 @@ export default function ChatApp({ socket, user }) {
         groupId: currentGroup._id,
       })
 
-      // Show outgoing call UI to caller
       setOutgoingCall(callData)
 
-      // Play ring sound for caller
       if (ringAudio) {
         try {
           if (ringAudio.currentTime !== undefined) {
@@ -672,6 +670,35 @@ export default function ChatApp({ socket, user }) {
     }
   }
 
+  const handleJoinGroupCall = (groupId, callType) => {
+    if (socket && socket.connected) {
+      const activeCall = activeGroupCalls[groupId]
+      if (activeCall) {
+        // Use the active call's type if no specific type is provided
+        const finalCallType = callType || activeCall.callType || "audio"
+
+        const callData = {
+          callId: activeCall.callId,
+          caller: user,
+          groupName: currentGroup?.name || "Group",
+          callType: finalCallType,
+          groupId: groupId,
+          isGroupCall: true,
+          status: "active",
+        }
+
+        socket.emit("BE-join-active-call", {
+          callId: activeCall.callId,
+          groupId: groupId,
+          callType: finalCallType,
+        })
+
+        setCurrentCall(callData)
+        setIsInCall(true)
+      }
+    }
+  }
+
   const handleAcceptCall = () => {
     if (incomingCall && socket && socket.connected) {
       socket.emit("BE-accept-call", {
@@ -679,7 +706,6 @@ export default function ChatApp({ socket, user }) {
         callType: incomingCall.callType,
       })
 
-      // Stop ring sound
       if (ringAudio && ringAudio.pause) {
         ringAudio.pause()
         if (ringAudio.currentTime !== undefined) {
@@ -693,13 +719,20 @@ export default function ChatApp({ socket, user }) {
     }
   }
 
+  const handleJoinCall = () => {
+    if (incomingCall && socket && socket.connected) {
+      // Join an active group call
+      handleJoinGroupCall(incomingCall.groupId || incomingCall.callId, incomingCall.callType)
+      setIncomingCall(null)
+    }
+  }
+
   const handleRejectCall = () => {
     if (incomingCall && socket && socket.connected) {
       socket.emit("BE-reject-call", {
         callId: incomingCall.callId,
       })
 
-      // Stop ring sound
       if (ringAudio && ringAudio.pause) {
         ringAudio.pause()
         if (ringAudio.currentTime !== undefined) {
@@ -714,8 +747,9 @@ export default function ChatApp({ socket, user }) {
   const handleEndCall = () => {
     if (socket && socket.connected) {
       if (currentCall) {
-        socket.emit("BE-end-call", {
+        socket.emit("BE-leave-call", {
           callId: currentCall.callId,
+          userId: user.id,
         })
         setCurrentCall(null)
         setIsInCall(false)
@@ -729,7 +763,6 @@ export default function ChatApp({ socket, user }) {
       }
     }
 
-    // Stop ring sound
     if (ringAudio && ringAudio.pause) {
       ringAudio.pause()
       if (ringAudio.currentTime !== undefined) {
@@ -753,11 +786,9 @@ export default function ChatApp({ socket, user }) {
         onBack={() => setShowCallHistory(false)}
         onCall={(targetUser, callType) => {
           setShowCallHistory(false)
-          // Find and select the user first
           const foundUser = users.find((u) => u._id === targetUser._id)
           if (foundUser) {
             handleUserSelect(foundUser)
-            // Then initiate call after a short delay
             setTimeout(() => {
               if (callType === "video") {
                 handleVideoCall()
@@ -805,6 +836,8 @@ export default function ChatApp({ socket, user }) {
             isCreatingGroup={isCreatingGroup}
             onGroupVideoCall={handleGroupVideoCall}
             onGroupAudioCall={handleGroupAudioCall}
+            onJoinGroupCall={handleJoinGroupCall}
+            activeGroupCalls={activeGroupCalls}
           />
           <UsersList users={users} currentChatUser={currentChatUser} onUserSelect={handleUserSelect} />
         </div>
@@ -822,6 +855,8 @@ export default function ChatApp({ socket, user }) {
               isAdmin={isAdmin}
               onVideoCall={handleGroupVideoCall}
               onAudioCall={handleGroupAudioCall}
+              onJoinCall={(callType) => handleJoinGroupCall(currentGroupData._id, callType)}
+              activeCall={activeGroupCalls[currentGroupData._id]}
             />
           ) : currentRoomId && currentChatUser ? (
             <>
@@ -872,7 +907,14 @@ export default function ChatApp({ socket, user }) {
       </div>
 
       {/* Call Notifications */}
-      {incomingCall && <CallNotification call={incomingCall} onAccept={handleAcceptCall} onReject={handleRejectCall} />}
+      {incomingCall && (
+        <CallNotification
+          call={incomingCall}
+          onAccept={handleAcceptCall}
+          onReject={handleRejectCall}
+          onJoinCall={handleJoinCall}
+        />
+      )}
       {outgoingCall && <OutgoingCall call={outgoingCall} onEndCall={handleEndCall} />}
 
       {/* Call Engaged Message */}

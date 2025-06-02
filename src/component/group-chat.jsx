@@ -1,8 +1,7 @@
 import { useState } from "react"
 import { MessageList } from "./message-list"
 import { ChatInput } from "./chat-input"
-import { Video, Phone } from "lucide-react"
-
+import { Video, Phone, UserPlus } from "lucide-react"
 
 export function GroupChat({
   group,
@@ -14,6 +13,8 @@ export function GroupChat({
   isAdmin,
   onVideoCall,
   onAudioCall,
+  onJoinCall,
+  activeCall = null,
 }) {
   const [showSettings, setShowSettings] = useState(false)
 
@@ -25,6 +26,8 @@ export function GroupChat({
     )
   }
 
+  const isCallActive = activeCall && activeCall.status === "active"
+
   return (
     <div className="flex-1 flex flex-col min-h-0">
       {/* Group Header */}
@@ -32,24 +35,40 @@ export function GroupChat({
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-lg font-semibold">{group.name}</h2>
-            <div className="text-sm text-gray-500">{group.members ? group.members.length : 0} members</div>
+            <div className="text-sm text-gray-500">
+              {group.members ? group.members.length : 0} members
+              {isCallActive && <span className="text-green-600 font-medium ml-2">• Call Active</span>}
+            </div>
           </div>
 
           <div className="flex items-center gap-2">
-            <button
-              onClick={onAudioCall}
-              className="p-2 rounded-full hover:bg-gray-100 transition-colors"
-              title="Group Audio Call"
-            >
-              <Phone className="w-5 h-5 text-blue-600" />
-            </button>
-            <button
-              onClick={onVideoCall}
-              className="p-2 rounded-full hover:bg-gray-100 transition-colors"
-              title="Group Video Call"
-            >
-              <Video className="w-5 h-5 text-blue-600" />
-            </button>
+            {isCallActive ? (
+              <button
+                onClick={() => onJoinCall(activeCall.callType)} // Pass the actual call type
+                className="flex items-center gap-2 px-3 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors"
+                title={`Join Active ${activeCall.callType === "video" ? "Video" : "Audio"} Call`}
+              >
+                <UserPlus className="w-4 h-4" />
+                Join {activeCall.callType === "video" ? "Video" : "Audio"} Call
+              </button>
+            ) : (
+              <>
+                <button
+                  onClick={onAudioCall}
+                  className="p-2 rounded-full hover:bg-gray-100 transition-colors"
+                  title="Group Audio Call"
+                >
+                  <Phone className="w-5 h-5 text-blue-600" />
+                </button>
+                <button
+                  onClick={onVideoCall}
+                  className="p-2 rounded-full hover:bg-gray-100 transition-colors"
+                  title="Group Video Call"
+                >
+                  <Video className="w-5 h-5 text-blue-600" />
+                </button>
+              </>
+            )}
             {isAdmin && (
               <button className="p-2 hover:bg-gray-100 rounded" onClick={() => setShowSettings(!showSettings)}>
                 ⚙️

@@ -25,7 +25,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
   const lastConnectionAttemptRef = useRef({})
   const connectionCheckIntervalRef = useRef(null)
 
-
   const [isAudioEnabled, setIsAudioEnabled] = useState(true)
   const [isVideoEnabled, setIsVideoEnabled] = useState(call.callType === "video")
   const [connectedUsers, setConnectedUsers] = useState([])
@@ -45,7 +44,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
   const [showDebugInfo, setShowDebugInfo] = useState(false)
   const [debugMessages, setDebugMessages] = useState([])
 
-
+  // logging function
   const logDebug = useCallback((message, data = null) => {
     const timestamp = new Date().toISOString().split("T")[1].split(".")[0]
     const logMessage = `[${timestamp}] ${message}`
@@ -53,10 +52,11 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
     setDebugMessages((prev) => {
       const newMessages = [...prev, { time: timestamp, message, data: JSON.stringify(data || "") }]
-      return newMessages.slice(-50) 
+      return newMessages.slice(-50) // last 50 messages
     })
   }, [])
 
+  // Calculate grid layout based on number of participants
   useEffect(() => {
     const totalParticipants = Object.keys(remoteStreams).length + 1
 
@@ -73,6 +73,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     }
   }, [remoteStreams])
 
+  // Initialize call
   useEffect(() => {
     initializeCall()
 
@@ -86,7 +87,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     }
   }, [])
 
-  //better audio handling
+  // Initialize audio context for better audio handling
   useEffect(() => {
     try {
       const AudioContext = window.AudioContext || window.webkitAudioContext
@@ -103,12 +104,14 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     }
   }, [])
 
+  // Socket event listeners
   useEffect(() => {
     if (!socket) return
 
     socket.on("FE-user-joined-call", ({ userId, userInfo }) => {
       logDebug(`User joined call: ${userId}`, userInfo)
 
+      // Add to connected users if not already present
       setConnectedUsers((prev) => {
         if (prev.some((u) => u._id === userId || u.id === userId)) {
           return prev
@@ -116,11 +119,16 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         return [...prev, userInfo]
       })
 
+      // Add to participants map
       participantsMapRef.current.set(userId, userInfo)
 
       if (call.isGroupCall) {
+        // Only create connection if we haven't processed this participant yet
+        // or if the connection failed previously
         if (!processedParticipantsRef.current.has(userId) || connectionStatusRef.current[userId] === "failed") {
           processedParticipantsRef.current.add(userId)
+
+          // Stagger connection creation to avoid overwhelming the network
           const delay = Math.random() * 1000 + 500
           logDebug(`Scheduling connection to ${userId} in ${delay}ms`)
 
@@ -131,7 +139,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
           }, delay)
         }
       } else {
-        // One-to-one call
+        // One-to-one call logic
         setTimeout(() => {
           createPeerConnection(userId, userInfo)
         }, 300)
@@ -143,11 +151,14 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
       setConnectedUsers((prev) => prev.filter((u) => u._id !== userId && u.id !== userId))
 
+      // Remove from participants map
       participantsMapRef.current.delete(userId)
       processedParticipantsRef.current.delete(userId)
 
+      // Clean up connection
       cleanupPeerConnection(userId)
 
+      // Clear any pending reconnection attempts
       if (connectionTimersRef.current[userId]) {
         clearTimeout(connectionTimersRef.current[userId])
         delete connectionTimersRef.current[userId]
@@ -159,15 +170,19 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       delete connectionEstablishedRef.current[userId]
     })
 
+    // Group call specific: Get existing participants when joining
     socket.on("FE-existing-participants", ({ participants }) => {
       logDebug(`Received ${participants.length} existing participants`, participants)
 
       if (call.isGroupCall) {
+        // Clear processed participants to ensure fresh connections
         processedParticipantsRef.current.clear()
-        processedParticipantsRef.current.add(user.id) 
+        processedParticipantsRef.current.add(user.id) // Add self
 
+        // Update the connected users state
         const newConnectedUsers = []
 
+        // Process all participants
         participants.forEach((participant) => {
           if (participant.userId !== user.id) {
             processedParticipantsRef.current.add(participant.userId)
@@ -176,6 +191,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
           }
         })
 
+        // Update connected users state
         setConnectedUsers((prev) => {
           // Filter out duplicates
           const existingIds = new Set(newConnectedUsers.map((u) => u.id || u._id))
@@ -183,8 +199,10 @@ export function CallInterface({ call, user, socket, onEndCall }) {
           return [...filteredPrev, ...newConnectedUsers]
         })
 
+        // Create connections with staggered timing
         participants.forEach((participant, index) => {
           if (participant.userId !== user.id) {
+            // Use different delays to avoid simultaneous connections
             setTimeout(
               () => {
                 if (!connectionEstablishedRef.current[participant.userId]) {
@@ -196,6 +214,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
           }
         })
 
+        // Update connection stats
         setConnectionStats((prev) => ({
           ...prev,
           expected: participants.length,
@@ -241,9 +260,11 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     }
   }, [socket, call.isGroupCall, user.id, logDebug])
 
+  // Connection monitoring system
   useEffect(() => {
     if (!call.isGroupCall) return
 
+    // Set up connection monitoring
     connectionCheckIntervalRef.current = setInterval(() => {
       const now = Date.now()
       let connectedCount = 0
@@ -251,20 +272,24 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       let videoConnectedCount = 0
       let failedCount = 0
 
+      // Check all processed participants
       processedParticipantsRef.current.forEach((userId) => {
-        if (userId === user.id) return 
+        if (userId === user.id) return // Skip self
 
         const peerData = peerConnectionsRef.current[userId]
         const connectionStatus = connectionStatusRef.current[userId]
 
+        // If connection exists and is connected
         if (peerData && ["connected", "completed"].includes(peerData.connection.iceConnectionState)) {
           connectedCount++
           if (peerData.audioConnected) audioConnectedCount++
           if (peerData.videoConnected) videoConnectedCount++
         }
+        // If connection failed or doesn't exist but should
         else if (connectionStatus === "failed" || (!peerData && participantsMapRef.current.has(userId))) {
           failedCount++
 
+          // Check if we should attempt reconnection
           const lastAttempt = lastConnectionAttemptRef.current[userId] || 0
           const attempts = reconnectAttemptsRef.current[userId] || 0
 
@@ -272,15 +297,20 @@ export function CallInterface({ call, user, socket, onEndCall }) {
           if (now - lastAttempt > 10000 && attempts < 5 && !pendingConnectionsRef.current.has(userId)) {
             logDebug(`Auto-reconnecting to ${userId}, attempt ${attempts + 1}/5`)
 
+            // Clean up existing connection if any
             cleanupPeerConnection(userId)
 
+            // Mark as pending to prevent multiple attempts
             pendingConnectionsRef.current.add(userId)
 
+            // Update attempt count and timestamp
             reconnectAttemptsRef.current[userId] = attempts + 1
             lastConnectionAttemptRef.current[userId] = now
 
+            // Get user info
             const userInfo = participantsMapRef.current.get(userId)
 
+            // Create new connection with delay
             setTimeout(() => {
               pendingConnectionsRef.current.delete(userId)
               if (userInfo) {
@@ -291,14 +321,16 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         }
       })
 
+      // Update connection stats
       setConnectionStats({
-        expected: processedParticipantsRef.current.size - 1, 
+        expected: processedParticipantsRef.current.size - 1, // Exclude self
         connected: connectedCount,
         audioConnected: audioConnectedCount,
         videoConnected: videoConnectedCount,
         failed: failedCount,
       })
 
+      // Log connection status periodically
       logDebug(
         `Connection status: ${connectedCount}/${processedParticipantsRef.current.size - 1} connected, ${failedCount} failed`,
       )
@@ -311,6 +343,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     }
   }, [call.isGroupCall, user.id, logDebug])
 
+  // Monitor audio levels
   useEffect(() => {
     const audioLevelInterval = setInterval(() => {
       Object.keys(remoteStreams).forEach((userId) => {
@@ -318,6 +351,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         if (stream && stream.getAudioTracks().length > 0) {
           const audioTrack = stream.getAudioTracks()[0]
 
+          // Check if audio track is enabled and active
           if (audioTrack && audioTrack.enabled && audioTrack.readyState === "live") {
             setAudioLevels((prev) => ({
               ...prev,
@@ -339,6 +373,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
   const initializeCall = async () => {
     try {
+      // Enhanced audio constraints for better quality and noise suppression
       const constraints = {
         audio: {
           echoCancellation: true,
@@ -362,6 +397,8 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       const stream = await navigator.mediaDevices.getUserMedia(constraints)
 
       localStreamRef.current = stream
+
+      // Ensure audio tracks are enabled and properly configured
       stream.getAudioTracks().forEach((track) => {
         track.enabled = true
         logDebug("Local audio track enabled:", { enabled: track.enabled, readyState: track.readyState })
@@ -374,6 +411,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         localVideoRef.current.autoplay = true
       }
 
+      // Join the call room
       socket.emit("BE-join-call", {
         callId: call.callId,
         userId: user.id,
@@ -381,14 +419,16 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       })
 
       if (call.isGroupCall) {
+        // For group calls, add self to participants
         processedParticipantsRef.current.add(user.id)
         participantsMapRef.current.set(user.id, user)
 
+        // Request existing participants
         setTimeout(() => {
           socket.emit("BE-get-call-participants", { callId: call.callId })
         }, 1000)
       } else {
-        // one-to-one calls
+        // For one-to-one calls
         const otherUserId = call.caller.id === user.id ? call.receiver._id : call.caller._id
         const otherUserInfo = call.caller.id === user.id ? call.receiver : call.caller
 
@@ -425,7 +465,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       delete videoSendersRef.current[userId]
       delete iceCandidateBuffersRef.current[userId]
 
-      //audio processing
+      // Clean up audio processing
       if (audioSourcesRef.current[userId]) {
         try {
           if (audioSourcesRef.current[userId].source) {
@@ -461,7 +501,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         return newLevels
       })
 
-      // Clean up video
+      // Clean up video element
       if (remoteVideosRef.current[userId]) {
         const videoElement = remoteVideosRef.current[userId]
         if (videoElement.srcObject) {
@@ -477,6 +517,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
   const createPeerConnection = async (userId, userInfo, shouldInitiateOffer = null) => {
     try {
+      // Prevent duplicate connections
       if (peerConnectionsRef.current[userId]) {
         const existingConnection = peerConnectionsRef.current[userId].connection
         if (existingConnection.connectionState === "connected" || existingConnection.connectionState === "connecting") {
@@ -489,9 +530,11 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
       logDebug(`Creating peer connection for user ${userId}`, { userInfo, shouldInitiateOffer })
 
+      // Update connection status and attempt tracking
       connectionStatusRef.current[userId] = "connecting"
       lastConnectionAttemptRef.current[userId] = Date.now()
 
+      // Enhanced ICE servers configuration for better connectivity
       const configuration = {
         iceServers: [
           { urls: "stun:stun.l.google.com:19302" },
@@ -530,7 +573,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         connectionAttempts: reconnectAttemptsRef.current[userId] || 0,
       }
 
-      // Add local stream tracks with audio handling
+      // Add local stream tracks with enhanced audio handling
       if (localStreamRef.current) {
         audioSendersRef.current[userId] = []
         videoSendersRef.current[userId] = []
@@ -538,8 +581,9 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         localStreamRef.current.getTracks().forEach((track) => {
           logDebug(`Adding ${track.kind} track to peer connection for ${userId}`)
 
-          // audio tracks in group calls
+          // Special handling for audio tracks in group calls
           if (track.kind === "audio" && call.isGroupCall) {
+            // Clone the audio track to ensure each connection gets its own track
             const clonedTrack = track.clone()
             clonedTrack.enabled = isAudioEnabled
 
@@ -559,7 +603,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         })
       }
 
-      // Handle incoming tracks with  audio processing
+      // Handle incoming tracks with enhanced audio processing
       peerConnection.ontrack = (event) => {
         logDebug(`Received ${event.track.kind} track from ${userId}`)
         const [remoteStream] = event.streams
@@ -567,11 +611,11 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         if (remoteStream) {
           logDebug(`Setting remote stream for ${userId}`)
 
-          //audio tracks
+          // Special handling for audio tracks
           if (event.track.kind === "audio") {
             peerConnectionsRef.current[userId].audioConnected = true
 
-            // audio track details
+            // Log audio track details
             logDebug(`Audio track from ${userId}:`, {
               enabled: event.track.enabled,
               readyState: event.track.readyState,
@@ -582,7 +626,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
             // Force unmute the track
             event.track.enabled = true
 
-            // Connect to audio context for if available
+            // Connect to audio context for better processing if available
             if (audioContextRef.current && audioContextRef.current.state !== "closed") {
               try {
                 // Create a gain node to reduce background noise
@@ -622,6 +666,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
             [userId]: remoteStream,
           }))
 
+          // Initialize remote user state
           setRemoteUserStates((prev) => ({
             ...prev,
             [userId]: {
@@ -630,12 +675,13 @@ export function CallInterface({ call, user, socket, onEndCall }) {
             },
           }))
 
+          // Mark connection as established
           connectionEstablishedRef.current[userId] = true
           connectionStatusRef.current[userId] = "connected"
         }
       }
 
-      // ICE candidate
+      // ICE candidate handling
       peerConnection.onicecandidate = (event) => {
         if (event.candidate) {
           logDebug(`Generated ICE candidate for ${userId}`, event.candidate)
@@ -1400,13 +1446,13 @@ export function CallInterface({ call, user, socket, onEndCall }) {
             {formatDuration(callDuration)} • {actualParticipantCount} participant
             {actualParticipantCount !== 1 ? "s" : ""}
           </p>
-          {call.isGroupCall && (
+          {/* {call.isGroupCall && (
             <p className="text-xs text-gray-400">
               Expected: {expectedParticipantCount} | Connected: {connectionStats.connected}/{connectionStats.expected} |
               Audio: {connectionStats.audioConnected} | Video: {connectionStats.videoConnected} | Failed:{" "}
               {connectionStats.failed}
             </p>
-          )}
+          )} */}
         </div>
         <div className="flex items-center gap-2">
           <span className="text-sm text-gray-300 flex items-center">
@@ -1415,15 +1461,15 @@ export function CallInterface({ call, user, socket, onEndCall }) {
           </span>
 
           {/* Debug toggle */}
-          <button
+          {/* <button
             onClick={() => setShowDebugInfo(!showDebugInfo)}
             className="bg-gray-600 text-white p-1 rounded hover:bg-gray-700"
             title="Toggle debug info"
           >
             <AlertCircle className="w-4 h-4" />
-          </button>
+          </button> */}
 
-          {call.isGroupCall && (
+          {/* {call.isGroupCall && (
             <button
               onClick={forceReconnectAll}
               disabled={isReconnecting}
@@ -1435,7 +1481,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
               <RefreshCw className={`w-3 h-3 ${isReconnecting ? "animate-spin" : ""}`} />
               {isReconnecting ? "Reconnecting..." : "Reconnect"}
             </button>
-          )}
+          )} */}
           <button onClick={onEndCall} className="bg-red-500 text-white p-2 rounded-full hover:bg-red-600">
             <PhoneOff className="w-5 h-5" />
           </button>
