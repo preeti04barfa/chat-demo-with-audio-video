@@ -1,4 +1,4 @@
-import { Phone, Video, PhoneIncoming, PhoneOutgoing, PhoneMissed, Clock } from 'lucide-react'
+import { Phone, Video, PhoneIncoming, PhoneOutgoing, PhoneMissed, Clock } from "lucide-react"
 
 export function CallHistoryMessage({ call, currentUser, onCall }) {
   const isIncoming = call.receiver && call.receiver._id === currentUser.id
@@ -57,15 +57,15 @@ export function CallHistoryMessage({ call, currentUser, onCall }) {
 
       <div className="flex-1">
         <div className="font-medium text-sm">
-          {call.isGroupCall ? `Group ${call.callType} call` : `${call.callType.charAt(0).toUpperCase() + call.callType.slice(1)} call`}
+          {call.isGroupCall
+            ? `Group ${call.callType} call`
+            : `${call.callType.charAt(0).toUpperCase() + call.callType.slice(1)} call`}
         </div>
         <div className="text-xs text-gray-500 flex items-center gap-1">
           <Clock className="w-3 h-3" />
           {getCallStatus()}
         </div>
-        <div className="text-xs text-gray-400">
-          {new Date(call.startTime).toLocaleString()}
-        </div>
+        <div className="text-xs text-gray-400">{new Date(call.startTime).toLocaleString()}</div>
       </div>
 
       {!call.isGroupCall && callUser && call.status !== "ringing" && (

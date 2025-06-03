@@ -59,7 +59,7 @@ export function GroupList({
                   <div className="font-medium truncate">{group.name}</div>
                   <div className="text-sm text-gray-500">
                     {group.members ? group.members.length : 0} members
-                    {isCallActive && <span className="text-green-600 font-medium ml-2">• Call Active</span>}
+                    {isCallActive && <span className="text-green-600 font-medium ml-2">• SFU Call Active</span>}
                   </div>
                 </div>
                 {currentGroup?._id === group._id && (
@@ -71,7 +71,7 @@ export function GroupList({
                           onJoinGroupCall(group._id, activeCall.callType) // Pass the actual call type
                         }}
                         className="p-1 rounded hover:bg-gray-200 bg-green-100"
-                        title={`Join Active ${activeCall.callType === "video" ? "Video" : "Audio"} Call`}
+                        title={`Join Active ${activeCall.callType === "video" ? "Video" : "Audio"} Call (SFU)`}
                       >
                         <UserPlus className="w-4 h-4 text-green-600" />
                       </button>
@@ -83,7 +83,7 @@ export function GroupList({
                             onGroupAudioCall()
                           }}
                           className="p-1 rounded hover:bg-gray-200"
-                          title="Group Audio Call"
+                          title="Group Audio Call (SFU)"
                         >
                           <Phone className="w-4 h-4 text-blue-600" />
                         </button>
@@ -93,7 +93,7 @@ export function GroupList({
                             onGroupVideoCall()
                           }}
                           className="p-1 rounded hover:bg-gray-200"
-                          title="Group Video Call"
+                          title="Group Video Call (SFU)"
                         >
                           <Video className="w-4 h-4 text-blue-600" />
                         </button>
