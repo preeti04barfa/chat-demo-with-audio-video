@@ -1,3 +1,4 @@
+
 import { useEffect, useRef, useState, useCallback } from "react"
 import { PhoneOff, Mic, MicOff, Video, VideoOff, Users } from "lucide-react"
 
@@ -8,21 +9,20 @@ export function CallInterface({ call, user, socket, onEndCall }) {
   const peerConnectionsRef = useRef({})
   const audioSendersRef = useRef({})
   const videoSendersRef = useRef({})
-  const containerRef = useRef(null)
 
   // SFU-specific refs
   const isHubRef = useRef(false)
   const hubUserIdRef = useRef(null)
-  const forwardingStreamsRef = useRef({})
-  const forwardedTracksRef = useRef({}) 
-
+  const remoteStreamsMapRef = useRef({})
+  const iceCandidateBuffersRef = useRef({})
   const connectionStatusRef = useRef({})
   const connectionTimersRef = useRef({})
   const reconnectAttemptsRef = useRef({})
   const processedParticipantsRef = useRef(new Set())
   const participantsMapRef = useRef(new Map())
-  const iceCandidateBuffersRef = useRef({})
-  const connectionEstablishedRef = useRef({})
+
+  // Track which streams have been forwarded to which users
+  const forwardedStreamsRef = useRef({}) // {targetUserId: Set<sourceUserId>}
 
   const [isAudioEnabled, setIsAudioEnabled] = useState(true)
   const [isVideoEnabled, setIsVideoEnabled] = useState(call.callType === "video")
@@ -31,18 +31,11 @@ export function CallInterface({ call, user, socket, onEndCall }) {
   const [remoteStreams, setRemoteStreams] = useState({})
   const [remoteUserStates, setRemoteUserStates] = useState({})
   const [gridLayout, setGridLayout] = useState("grid-cols-1")
-  const [debugMessages, setDebugMessages] = useState([])
 
   // Logging function
   const logDebug = useCallback((message, data = null) => {
     const timestamp = new Date().toISOString().split("T")[1].split(".")[0]
-    const logMessage = `[${timestamp}] ${message}`
-    console.log(logMessage, data || "")
-
-    setDebugMessages((prev) => {
-      const newMessages = [...prev, { time: timestamp, message, data: JSON.stringify(data || "") }]
-      return newMessages.slice(-50)
-    })
+    console.log(`[SFU ${timestamp}] ${message}`, data || "")
   }, [])
 
   // Calculate grid layout
@@ -57,13 +50,22 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       setGridLayout("grid-cols-2")
     } else if (totalParticipants <= 9) {
       setGridLayout("grid-cols-3")
-    } else {
+    } else if (totalParticipants <= 16) {
       setGridLayout("grid-cols-4")
+    } else if (totalParticipants <= 25) {
+      setGridLayout("grid-cols-5")
+    } else {
+      setGridLayout("grid-cols-6")
     }
   }, [remoteStreams])
 
   // Initialize call
   useEffect(() => {
+    // Reset all state
+    forwardedStreamsRef.current = {}
+    remoteStreamsMapRef.current = {}
+    iceCandidateBuffersRef.current = {}
+
     initializeCall()
 
     const timer = setInterval(() => {
@@ -75,6 +77,19 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       cleanup()
     }
   }, [])
+
+  // Periodic forwarding check for hub - CRITICAL for ensuring all streams are forwarded
+  useEffect(() => {
+    if (!call.isGroupCall) return
+
+    const interval = setInterval(() => {
+      if (isHubRef.current) {
+        ensureAllStreamsForwarded()
+      }
+    }, 2000) // Check every 2 seconds
+
+    return () => clearInterval(interval)
+  }, [call.isGroupCall])
 
   // Socket event listeners
   useEffect(() => {
@@ -95,7 +110,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       if (call.isGroupCall) {
         handleGroupCallParticipant(userId, userInfo)
       } else {
-        // One-to-one call - direct P2P
         setTimeout(() => {
           createPeerConnection(userId, userInfo)
         }, 300)
@@ -111,7 +125,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
       cleanupPeerConnection(userId)
 
-      // If the hub left, elect new hub
       if (call.isGroupCall && hubUserIdRef.current === userId) {
         electNewHub()
       }
@@ -123,7 +136,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
       delete reconnectAttemptsRef.current[userId]
       delete connectionStatusRef.current[userId]
-      delete connectionEstablishedRef.current[userId]
     })
 
     socket.on("FE-existing-participants", ({ participants }) => {
@@ -149,57 +161,52 @@ export function CallInterface({ call, user, socket, onEndCall }) {
           return [...filteredPrev, ...newConnectedUsers]
         })
 
-        // Determine hub and establish SFU connections
         setupSFUConnections(participants)
       }
     })
 
     socket.on("FE-hub-assignment", ({ hubUserId }) => {
       logDebug(`Hub assigned: ${hubUserId}`)
-      const wasHub = isHubRef.current
       hubUserIdRef.current = hubUserId
       isHubRef.current = hubUserId === user.id
 
       if (isHubRef.current) {
         logDebug("I am the hub for this group call")
-        // Initialize forwarded tracks tracking for all participants
-        forwardedTracksRef.current = {}
+        // Reset forwarding state
+        forwardedStreamsRef.current = {}
 
-        // If we just became the hub, establish connections with all participants
-        if (!wasHub) {
-          setTimeout(() => {
-            establishHubConnections()
-          }, 1000)
-        }
+        setTimeout(() => {
+          connectToAllParticipants()
+        }, 1000)
       } else {
         logDebug(`Connecting to hub: ${hubUserId}`)
-        // Clean up any existing connections except to the hub
+
+        // Clean up connections to non-hub users
         Object.keys(peerConnectionsRef.current).forEach((userId) => {
           if (userId !== hubUserId) {
             cleanupPeerConnection(userId)
           }
         })
 
-        // Connect to hub
         const hubUserInfo = participantsMapRef.current.get(hubUserId)
         if (hubUserInfo) {
-          createPeerConnection(hubUserId, hubUserInfo, true)
+          createPeerConnection(hubUserId, hubUserInfo, false)
         }
       }
     })
 
     socket.on("FE-webrtc-offer", async ({ from, offer }) => {
-      logDebug(`Received offer from: ${from}`, offer)
+      logDebug(`Received offer from: ${from}`)
       await handleOffer(from, offer)
     })
 
     socket.on("FE-webrtc-answer", async ({ from, answer }) => {
-      logDebug(`Received answer from: ${from}`, answer)
+      logDebug(`Received answer from: ${from}`)
       await handleAnswer(from, answer)
     })
 
     socket.on("FE-webrtc-ice-candidate", async ({ from, candidate }) => {
-      logDebug(`Received ICE candidate from: ${from}`, candidate)
+      logDebug(`Received ICE candidate from: ${from}`)
       await handleIceCandidate(from, candidate)
     })
 
@@ -225,7 +232,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       socket.off("FE-webrtc-ice-candidate")
       socket.off("FE-track-state-changed")
     }
-  }, [socket, call.isGroupCall, user.id, logDebug])
+  }, [socket, call.isGroupCall, user.id])
 
   const initializeCall = async () => {
     try {
@@ -234,8 +241,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
-          sampleRate: 48000,
-          channelCount: 2,
         },
         video:
           call.callType === "video"
@@ -253,11 +258,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
       localStreamRef.current = stream
 
-      stream.getAudioTracks().forEach((track) => {
-        track.enabled = true
-        logDebug("Local audio track enabled:", { enabled: track.enabled, readyState: track.readyState })
-      })
-
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream
         localVideoRef.current.muted = true
@@ -274,12 +274,12 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       if (call.isGroupCall) {
         processedParticipantsRef.current.add(user.id)
         participantsMapRef.current.set(user.id, user)
+        remoteStreamsMapRef.current[user.id] = stream
 
         setTimeout(() => {
           socket.emit("BE-get-call-participants", { callId: call.callId })
         }, 1000)
       } else {
-        // One-to-one call setup
         const otherUserId = call.caller.id === user.id ? call.receiver._id : call.caller._id
         const otherUserInfo = call.caller.id === user.id ? call.receiver : call.caller
 
@@ -308,27 +308,24 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     if (!processedParticipantsRef.current.has(userId)) {
       processedParticipantsRef.current.add(userId)
 
-      // If we're the hub, establish connection with this participant
       if (isHubRef.current) {
-        logDebug(`As hub, establishing connection with ${userId}`)
-        setTimeout(() => {
-          createPeerConnection(userId, userInfo, false)
-        }, 500)
-      } else if (hubUserIdRef.current === userId) {
-        // This is the hub joining, connect to them
-        logDebug(`Hub ${userId} joined, connecting to them`)
+        logDebug(`Hub connecting to new participant ${userId}`)
         setTimeout(() => {
           createPeerConnection(userId, userInfo, true)
+        }, 500)
+      } else if (userId === hubUserIdRef.current) {
+        logDebug(`Connecting to hub ${userId}`)
+        setTimeout(() => {
+          createPeerConnection(userId, userInfo, false)
         }, 500)
       }
     }
   }
 
   const setupSFUConnections = (participants) => {
-    // Elect hub (first participant by join time or user ID)
     const sortedParticipants = [...participants].sort((a, b) => {
       if (a.joinedAt && b.joinedAt) {
-        return new Date(a.joinedAt) - new Date(b.joinedAt)
+        return new Date(a.joinedAt).getTime() - new Date(b.joinedAt).getTime()
       }
       return a.userId.localeCompare(b.userId)
     })
@@ -341,48 +338,39 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
       logDebug(`Hub elected: ${hubUserId}, I am hub: ${isHubRef.current}`)
 
-      // Notify server about hub assignment
       socket.emit("BE-hub-assignment", {
         callId: call.callId,
         hubUserId: hubUserId,
       })
 
-      if (isHubRef.current) {
-        // As hub, establish connections with all other participants
-        setTimeout(() => {
-          establishHubConnections()
-        }, 1000)
-      } else {
-        // Connect to hub only
-        const hubUserInfo = participantsMapRef.current.get(hubUserId)
-        if (hubUserInfo) {
-          setTimeout(() => {
-            createPeerConnection(hubUserId, hubUserInfo, true)
-          }, 1000)
+      setTimeout(() => {
+        if (isHubRef.current) {
+          connectToAllParticipants()
+        } else {
+          const hubUserInfo = participantsMapRef.current.get(hubUserId)
+          if (hubUserInfo) {
+            createPeerConnection(hubUserId, hubUserInfo, false)
+          }
         }
-      }
+      }, 1000)
     }
   }
 
-  const establishHubConnections = () => {
-    if (!isHubRef.current) return
+  const connectToAllParticipants = () => {
+    logDebug("Hub connecting to all participants")
 
-    logDebug("Establishing hub connections with all participants")
-
-    // Connect to all participants except ourselves
     Array.from(processedParticipantsRef.current).forEach((userId) => {
-      if (userId !== user.id && !peerConnectionsRef.current[userId]) {
+      if (userId !== user.id) {
         const userInfo = participantsMapRef.current.get(userId)
-        if (userInfo) {
-          logDebug(`Hub establishing connection with ${userId}`)
-          createPeerConnection(userId, userInfo, false)
+        if (userInfo && !peerConnectionsRef.current[userId]) {
+          logDebug(`Hub creating connection to participant: ${userId}`)
+          createPeerConnection(userId, userInfo, true)
         }
       }
     })
   }
 
   const electNewHub = () => {
-    // Elect new hub from remaining participants
     const remainingParticipants = Array.from(processedParticipantsRef.current).filter(
       (id) => id !== hubUserIdRef.current && participantsMapRef.current.has(id),
     )
@@ -394,34 +382,131 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
       logDebug(`New hub elected: ${newHubUserId}, I am hub: ${isHubRef.current}`)
 
-      // Notify all participants about new hub
       socket.emit("BE-hub-assignment", {
         callId: call.callId,
         hubUserId: newHubUserId,
       })
 
-      if (isHubRef.current) {
-        // We became the new hub, establish connections with all participants
-        setTimeout(() => {
-          establishHubConnections()
-        }, 1000)
-      } else {
-        // Clean up old connections and connect to new hub
-        Object.keys(peerConnectionsRef.current).forEach((userId) => {
-          if (userId !== newHubUserId) {
-            cleanupPeerConnection(userId)
-          }
-        })
-
-        // Connect to new hub
-        const hubUserInfo = participantsMapRef.current.get(newHubUserId)
-        if (hubUserInfo) {
+      setTimeout(() => {
+        if (isHubRef.current) {
+          forwardedStreamsRef.current = {}
+          connectToAllParticipants()
           setTimeout(() => {
-            createPeerConnection(newHubUserId, hubUserInfo, true)
-          }, 1000)
+            ensureAllStreamsForwarded()
+          }, 2000)
+        } else {
+          Object.keys(peerConnectionsRef.current).forEach((userId) => {
+            if (userId !== newHubUserId) {
+              cleanupPeerConnection(userId)
+            }
+          })
+
+          const hubUserInfo = participantsMapRef.current.get(newHubUserId)
+          if (hubUserInfo) {
+            createPeerConnection(newHubUserId, hubUserInfo, false)
+          }
         }
-      }
+      }, 1000)
     }
+  }
+
+  // IMPROVED: Core SFU forwarding function - ensures streams reach all participants
+  const forwardStreamToParticipant = (sourceUserId, targetUserId, stream) => {
+    if (!isHubRef.current || sourceUserId === targetUserId) return false
+
+    const targetPeer = peerConnectionsRef.current[targetUserId]
+    if (!targetPeer || targetPeer.connection.connectionState !== "connected") {
+      logDebug(`Target peer ${targetUserId} not ready for forwarding`)
+      return false
+    }
+
+    // Initialize forwarding tracking for target
+    if (!forwardedStreamsRef.current[targetUserId]) {
+      forwardedStreamsRef.current[targetUserId] = new Set()
+    }
+
+    // Check if already forwarded
+    if (forwardedStreamsRef.current[targetUserId].has(sourceUserId)) {
+      logDebug(`Stream from ${sourceUserId} already forwarded to ${targetUserId}`)
+      return true
+    }
+
+    logDebug(`Hub forwarding stream from ${sourceUserId} to ${targetUserId}`)
+
+    try {
+      let tracksAdded = 0
+
+      stream.getTracks().forEach((track) => {
+        try {
+          // Clone the track to avoid conflicts
+          const clonedTrack = track.clone()
+          
+          // Create a new stream for this forwarded track
+          const forwardedStream = new MediaStream([clonedTrack])
+          
+          // Add track to peer connection
+          targetPeer.connection.addTrack(clonedTrack, forwardedStream)
+          tracksAdded++
+          logDebug(`Added ${track.kind} track from ${sourceUserId} to ${targetUserId}`)
+        } catch (error) {
+          logDebug(`Error adding track from ${sourceUserId} to ${targetUserId}:`, error)
+        }
+      })
+
+      if (tracksAdded > 0) {
+        forwardedStreamsRef.current[targetUserId].add(sourceUserId)
+        logDebug(`Successfully forwarded ${tracksAdded} tracks from ${sourceUserId} to ${targetUserId}`)
+        return true
+      }
+    } catch (error) {
+      logDebug(`Error forwarding stream from ${sourceUserId} to ${targetUserId}:`, error)
+    }
+
+    return false
+  }
+
+  // IMPROVED: Critical function to ensure all streams are forwarded to all participants
+  const ensureAllStreamsForwarded = () => {
+    if (!isHubRef.current) return
+
+    logDebug("Hub ensuring all streams are forwarded to all participants")
+
+    // Get all connected participants (excluding hub itself)
+    const allParticipants = Object.keys(peerConnectionsRef.current).filter(id => id !== user.id)
+
+    // Get all available streams (including hub's own stream)
+    const allStreams = { ...remoteStreamsMapRef.current }
+    if (localStreamRef.current) {
+      allStreams[user.id] = localStreamRef.current
+    }
+
+    logDebug(`Hub has ${Object.keys(allStreams).length} streams to forward to ${allParticipants.length} participants`)
+
+    // For each participant, ensure they receive ALL streams
+    allParticipants.forEach((targetUserId) => {
+      logDebug(`Ensuring participant ${targetUserId} receives all streams`)
+      
+      // For each stream, ensure it's forwarded to this participant
+      Object.entries(allStreams).forEach(([sourceUserId, stream]) => {
+        if (sourceUserId !== targetUserId && stream) {
+          const success = forwardStreamToParticipant(sourceUserId, targetUserId, stream)
+          if (success) {
+            logDebug(`✓ Stream from ${sourceUserId} forwarded to ${targetUserId}`)
+          } else {
+            logDebug(`✗ Failed to forward stream from ${sourceUserId} to ${targetUserId}`)
+          }
+        }
+      })
+    })
+
+    // Log current forwarding status
+    logDebug("Current forwarding status:", {
+      totalStreams: Object.keys(allStreams).length,
+      totalParticipants: allParticipants.length,
+      forwardingMap: Object.fromEntries(
+        Object.entries(forwardedStreamsRef.current).map(([key, value]) => [key, Array.from(value)])
+      )
+    })
   }
 
   const createPeerConnection = async (userId, userInfo, shouldInitiateOffer = null) => {
@@ -429,14 +514,13 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       if (peerConnectionsRef.current[userId]) {
         const existingConnection = peerConnectionsRef.current[userId].connection
         if (existingConnection.connectionState === "connected" || existingConnection.connectionState === "connecting") {
-          logDebug(`Peer connection for user ${userId} already exists and is connecting/connected`)
+          logDebug(`Peer connection for user ${userId} already exists`)
           return existingConnection
         }
-        logDebug(`Peer connection for user ${userId} exists but not connected, cleaning up first`)
         cleanupPeerConnection(userId)
       }
 
-      logDebug(`Creating peer connection for user ${userId}`, { userInfo, shouldInitiateOffer })
+      logDebug(`Creating peer connection for user ${userId}`)
 
       connectionStatusRef.current[userId] = "connecting"
 
@@ -444,9 +528,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         iceServers: [
           { urls: "stun:stun.l.google.com:19302" },
           { urls: "stun:stun1.l.google.com:19302" },
-          { urls: "stun:stun2.l.google.com:19302" },
-          { urls: "stun:stun3.l.google.com:19302" },
-          { urls: "stun:stun4.l.google.com:19302" },
           {
             urls: "turn:numb.viagenie.ca",
             credential: "muazkh",
@@ -454,13 +535,9 @@ export function CallInterface({ call, user, socket, onEndCall }) {
           },
         ],
         iceCandidatePoolSize: 10,
-        bundlePolicy: "max-bundle",
-        rtcpMuxPolicy: "require",
-        sdpSemantics: "unified-plan",
       }
 
       const peerConnection = new RTCPeerConnection(configuration)
-
       iceCandidateBuffersRef.current[userId] = []
 
       peerConnectionsRef.current[userId] = {
@@ -472,12 +549,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         connectionState: "new",
         offerSent: false,
         answerSent: false,
-        connectionAttempts: reconnectAttemptsRef.current[userId] || 0,
-      }
-
-      // Initialize forwarded tracks tracking for this connection
-      if (isHubRef.current) {
-        forwardedTracksRef.current[userId] = new Set()
       }
 
       // Add local stream tracks
@@ -486,7 +557,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         videoSendersRef.current[userId] = []
 
         localStreamRef.current.getTracks().forEach((track) => {
-          logDebug(`Adding ${track.kind} track to peer connection for ${userId}`)
           const sender = peerConnection.addTrack(track, localStreamRef.current)
           if (track.kind === "audio") {
             audioSendersRef.current[userId].push(sender)
@@ -496,34 +566,24 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         })
       }
 
-      // If we're the hub, add all existing forwarded streams to this new connection
-      if (isHubRef.current) {
-        Object.entries(forwardingStreamsRef.current).forEach(([sourceUserId, stream]) => {
-          if (sourceUserId !== userId) {
-            addStreamToConnection(peerConnection, stream, userId, sourceUserId)
-          }
-        })
-      }
-
-      // Handle incoming tracks
+      // IMPROVED: Handle incoming tracks - crucial for participants to receive forwarded streams
       peerConnection.ontrack = (event) => {
-        logDebug(`Received ${event.track.kind} track from ${userId}`)
+        logDebug(`Received track from ${userId}`, event)
         const [remoteStream] = event.streams
 
         if (remoteStream) {
-          logDebug(`Setting remote stream for ${userId}`)
+          logDebug(`Setting up remote stream for ${userId}`)
 
           // Store the stream
-          setRemoteStreams((prev) => ({
-            ...prev,
-            [userId]: remoteStream,
-          }))
+          remoteStreamsMapRef.current[userId] = remoteStream
 
-          // If we're the hub, forward this stream to all other participants
-          if (call.isGroupCall && isHubRef.current && userId !== user.id) {
-            forwardingStreamsRef.current[userId] = remoteStream
-            forwardStreamToAllOthers(userId, remoteStream)
-          }
+          setRemoteStreams((prev) => {
+            logDebug(`Adding remote stream for ${userId} to state`)
+            return {
+              ...prev,
+              [userId]: remoteStream,
+            }
+          })
 
           setRemoteUserStates((prev) => ({
             ...prev,
@@ -533,15 +593,37 @@ export function CallInterface({ call, user, socket, onEndCall }) {
             },
           }))
 
-          connectionEstablishedRef.current[userId] = true
+          // If this is the hub receiving a stream, forward it to ALL other participants
+          if (call.isGroupCall && isHubRef.current) {
+            logDebug(`Hub received stream from ${userId}, forwarding to all other participants`)
+
+            // Immediately forward this stream to all other connected participants
+            setTimeout(() => {
+              Object.keys(peerConnectionsRef.current).forEach((targetUserId) => {
+                if (targetUserId !== userId && targetUserId !== user.id) {
+                  forwardStreamToParticipant(userId, targetUserId, remoteStream)
+                }
+              })
+
+              // Also ensure all existing streams are forwarded to this new participant
+              if (localStreamRef.current) {
+                forwardStreamToParticipant(user.id, userId, localStreamRef.current)
+              }
+
+              Object.entries(remoteStreamsMapRef.current).forEach(([sourceUserId, sourceStream]) => {
+                if (sourceUserId !== userId && sourceUserId !== user.id && sourceStream) {
+                  forwardStreamToParticipant(sourceUserId, userId, sourceStream)
+                }
+              })
+            }, 500)
+          }
+
           connectionStatusRef.current[userId] = "connected"
         }
       }
 
-      // ICE candidate handling
       peerConnection.onicecandidate = (event) => {
         if (event.candidate) {
-          logDebug(`Generated ICE candidate for ${userId}`, event.candidate)
           socket.emit("BE-webrtc-ice-candidate", {
             to: userId,
             candidate: event.candidate,
@@ -550,99 +632,64 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         }
       }
 
-      // Connection state monitoring
       peerConnection.oniceconnectionstatechange = () => {
         logDebug(`ICE connection state for ${userId}: ${peerConnection.iceConnectionState}`)
-
-        if (peerConnectionsRef.current[userId]) {
-          peerConnectionsRef.current[userId].connectionState = peerConnection.iceConnectionState
-        }
-
         connectionStatusRef.current[userId] = peerConnection.iceConnectionState
 
         if (peerConnection.iceConnectionState === "connected" || peerConnection.iceConnectionState === "completed") {
           reconnectAttemptsRef.current[userId] = 0
-          connectionEstablishedRef.current[userId] = true
 
-          // If we're the hub and this connection just established, forward all existing streams
-          if (isHubRef.current && call.isGroupCall) {
-            setTimeout(() => {
-              forwardAllExistingStreamsToParticipant(userId)
-            }, 500)
-          }
-
-          if (iceCandidateBuffersRef.current[userId] && iceCandidateBuffersRef.current[userId].length > 0) {
-            logDebug(
-              `Processing ${iceCandidateBuffersRef.current[userId].length} buffered ICE candidates for ${userId}`,
-            )
-
+          // Process buffered ICE candidates
+          if (iceCandidateBuffersRef.current[userId]?.length > 0) {
             const candidates = [...iceCandidateBuffersRef.current[userId]]
             iceCandidateBuffersRef.current[userId] = []
 
             candidates.forEach(async (candidate) => {
               try {
                 await peerConnection.addIceCandidate(new RTCIceCandidate(candidate))
-                logDebug(`Added buffered ICE candidate for ${userId}`)
               } catch (e) {
-                logDebug(`Error adding buffered ICE candidate for ${userId}:`, e)
+                logDebug(`Error adding buffered ICE candidate:`, e)
               }
             })
+          }
+
+          // CRITICAL: If hub, ensure ALL streams are forwarded after connection is established
+          if (call.isGroupCall && isHubRef.current) {
+            setTimeout(() => {
+              logDebug(`Connection established with ${userId}, ensuring all streams forwarded`)
+              ensureAllStreamsForwarded()
+            }, 1000)
           }
         }
 
         if (peerConnection.iceConnectionState === "failed" || peerConnection.iceConnectionState === "disconnected") {
-          logDebug(`Connection to ${userId} ${peerConnection.iceConnectionState}, attempting restart`)
-
           if (!connectionTimersRef.current[userId]) {
             connectionTimersRef.current[userId] = setTimeout(() => {
               delete connectionTimersRef.current[userId]
-
               const attempts = reconnectAttemptsRef.current[userId] || 0
               if (attempts < 3) {
                 reconnectAttemptsRef.current[userId] = attempts + 1
-                logDebug(`Recreating connection to ${userId}, attempt ${attempts + 1}/3`)
-
                 cleanupPeerConnection(userId)
                 const userInfo = participantsMapRef.current.get(userId)
                 if (userInfo) {
                   setTimeout(() => {
-                    createPeerConnection(userId, userInfo, true)
+                    createPeerConnection(userId, userInfo, isHubRef.current)
                   }, 1000)
                 }
-              } else {
-                logDebug(`Max reconnection attempts reached for ${userId}`)
-                connectionStatusRef.current[userId] = "failed"
               }
             }, 3000)
           }
         }
       }
 
-      peerConnection.onconnectionstatechange = () => {
-        logDebug(`Connection state for ${userId}: ${peerConnection.connectionState}`)
-
-        if (peerConnectionsRef.current[userId]) {
-          peerConnectionsRef.current[userId].connectionState = peerConnection.connectionState
-        }
-
-        if (peerConnection.connectionState === "connected") {
-          reconnectAttemptsRef.current[userId] = 0
-          connectionEstablishedRef.current[userId] = true
-          connectionStatusRef.current[userId] = "connected"
-        }
-      }
-
-      // Determine who should create offer
+      // Determine who should initiate the offer
       if (call.isGroupCall) {
-        // In SFU mode: non-hub participants initiate offers to hub, hub accepts from all
-        shouldInitiateOffer = !isHubRef.current && userId === hubUserIdRef.current
+        shouldInitiateOffer = isHubRef.current
       } else {
-        // One-to-one: caller creates offer
         shouldInitiateOffer = call.caller.id === user.id
       }
 
       if (shouldInitiateOffer) {
-        peerConnectionsRef.current[userId].offerSent = true
         setTimeout(
           () => {
             if (peerConnection.signalingState === "stable") {
@@ -660,84 +707,18 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     }
   }
 
-  const addStreamToConnection = (peerConnection, stream, targetUserId, sourceUserId) => {
-    if (!forwardedTracksRef.current[targetUserId]) {
-      forwardedTracksRef.current[targetUserId] = new Set()
-    }
+  // ... keep existing code (createOffer, handleOffer, handleAnswer, handleIceCandidate, cleanupPeerConnection, toggleAudio, toggleVideo, cleanup, formatDuration, setupVideoElement functions)
 
-    stream.getTracks().forEach((track) => {
-      const trackId = `${sourceUserId}_${track.id}`
-
-      if (!forwardedTracksRef.current[targetUserId].has(trackId)) {
-        try {
-          peerConnection.addTrack(track, stream)
-          forwardedTracksRef.current[targetUserId].add(trackId)
-          logDebug(`Added forwarded ${track.kind} track from ${sourceUserId} to ${targetUserId}`)
-        } catch (error) {
-          logDebug(`Error adding forwarded track from ${sourceUserId} to ${targetUserId}:`, error)
-        }
-      }
-    })
-  }
-
-  const forwardStreamToAllOthers = (sourceUserId, stream) => {
-    if (!call.isGroupCall || !isHubRef.current) return
-
-    logDebug(`Forwarding stream from ${sourceUserId} to all other participants`)
-
-    // Forward to all connected participants (except source and self)
-    Object.keys(peerConnectionsRef.current).forEach((targetUserId) => {
-      if (targetUserId !== sourceUserId && targetUserId !== user.id) {
-        const peerData = peerConnectionsRef.current[targetUserId]
-        if (peerData && peerData.connection.connectionState === "connected") {
-          addStreamToConnection(peerData.connection, stream, targetUserId, sourceUserId)
-        }
-      }
-    })
-  }
-
-  const forwardAllExistingStreamsToParticipant = (targetUserId) => {
-    if (!call.isGroupCall || !isHubRef.current) return
-
-    logDebug(`Forwarding all existing streams to ${targetUserId}`)
-
-    const peerData = peerConnectionsRef.current[targetUserId]
-    if (!peerData || peerData.connection.connectionState !== "connected") {
-      return
-    }
-
-    // Forward all stored streams to this participant
-    Object.entries(forwardingStreamsRef.current).forEach(([sourceUserId, stream]) => {
-      if (sourceUserId !== targetUserId) {
-        addStreamToConnection(peerData.connection, stream, targetUserId, sourceUserId)
-      }
-    })
-  }
-
-  const createOffer = async (userId, peerConnection, isRestart = false) => {
+  const createOffer = async (userId, peerConnection) => {
     try {
       const peerData = peerConnectionsRef.current[userId]
+      if (!peerData || peerConnection.signalingState !== "stable") return
 
-      if (!peerData) {
-        logDebug(`No peer data found for ${userId}`)
-        return
-      }
-
-      if (peerConnection.signalingState !== "stable") {
-        logDebug(`Peer connection not in correct state for offer: ${peerConnection.signalingState}`)
-        return
-      }
-
-      logDebug(`Creating ${isRestart ? "restart " : ""}offer for ${userId}`)
-
-      const offerOptions = {
+      const offer = await peerConnection.createOffer({
         offerToReceiveAudio: true,
         offerToReceiveVideo: call.callType === "video",
-        voiceActivityDetection: true,
-        iceRestart: isRestart,
-      }
+      })
 
-      const offer = await peerConnection.createOffer(offerOptions)
       await peerConnection.setLocalDescription(offer)
       peerData.localDescriptionSet = true
       peerData.offerSent = true
@@ -751,68 +732,37 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       logDebug(`Offer sent to ${userId}`)
     } catch (error) {
       logDebug(`Error creating offer for ${userId}:`, error)
-      connectionStatusRef.current[userId] = "failed"
     }
   }
 
   const handleOffer = async (userId, offer) => {
     try {
-      logDebug(`Handling offer from ${userId}`)
-
       let peerConnection = peerConnectionsRef.current[userId]?.connection
       let peerData = peerConnectionsRef.current[userId]
 
       if (!peerConnection) {
         let userInfo = participantsMapRef.current.get(userId)
-
         if (!userInfo) {
-          if (call.isGroupCall) {
-            userInfo = connectedUsers.find((u) => u._id === userId || u.id === userId) || { id: userId, name: "User" }
-          } else {
-            userInfo = call.caller._id === userId || call.caller.id === userId ? call.caller : call.receiver
-          }
+          userInfo = connectedUsers.find((u) => u._id === userId || u.id === userId) || { id: userId, name: "User" }
           participantsMapRef.current.set(userId, userInfo)
         }
-
         peerConnection = await createPeerConnection(userId, userInfo, false)
         peerData = peerConnectionsRef.current[userId]
       }
 
-      if (!peerConnection || !peerData) {
-        logDebug(`Failed to create peer connection for ${userId}`)
-        return
-      }
+      if (!peerConnection || !peerData) return
 
       if (peerConnection.signalingState !== "stable") {
-        logDebug(`Peer connection not in correct state for remote offer: ${peerConnection.signalingState}`)
-
         if (peerConnection.signalingState === "have-local-offer") {
-          if (call.isGroupCall) {
-            if (user.id < userId) {
-              logDebug(`Backing down from offer conflict with ${userId}`)
-              await peerConnection.setLocalDescription({ type: "rollback" })
-              peerData.localDescriptionSet = false
-              peerData.offerSent = false
-            } else {
-              logDebug(`Ignoring offer from ${userId} due to conflict resolution`)
-              return
-            }
+          if (user.id < userId) {
+            await peerConnection.setLocalDescription({ type: "rollback" })
+            peerData.localDescriptionSet = false
+            peerData.offerSent = false
           } else {
-            if (call.caller.id !== user.id) {
-              logDebug(`Receiver backing down from offer conflict with ${userId}`)
-              await peerConnection.setLocalDescription({ type: "rollback" })
-              peerData.localDescriptionSet = false
-              peerData.offerSent = false
-            } else {
-              logDebug(`Caller ignoring offer from ${userId}`)
-              return
-            }
+            return
           }
         } else {
-          logDebug(`Cannot handle offer in state ${peerConnection.signalingState}, scheduling retry`)
-          setTimeout(() => {
-            handleOffer(userId, offer)
-          }, 1000)
+          setTimeout(() => handleOffer(userId, offer), 1000)
           return
         }
       }
@@ -820,30 +770,22 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       await peerConnection.setRemoteDescription(new RTCSessionDescription(offer))
       peerData.remoteDescriptionSet = true
 
-      if (iceCandidateBuffersRef.current[userId] && iceCandidateBuffersRef.current[userId].length > 0) {
-        logDebug(`Processing ${iceCandidateBuffersRef.current[userId].length} buffered ICE candidates for ${userId}`)
-
+      // Process buffered ICE candidates
+      if (iceCandidateBuffersRef.current[userId]?.length > 0) {
         const candidates = [...iceCandidateBuffersRef.current[userId]]
         iceCandidateBuffersRef.current[userId] = []
 
         for (const candidate of candidates) {
           try {
             await peerConnection.addIceCandidate(new RTCIceCandidate(candidate))
-            logDebug(`Added buffered ICE candidate for ${userId}`)
           } catch (e) {
-            logDebug(`Error adding buffered ICE candidate for ${userId}:`, e)
+            logDebug(`Error adding buffered ICE candidate:`, e)
           }
         }
       }
 
       if (!peerData.answerSent) {
-        const answerOptions = {
-          offerToReceiveAudio: true,
-          offerToReceiveVideo: call.callType === "video",
-          voiceActivityDetection: true,
-        }
-
-        const answer = await peerConnection.createAnswer(answerOptions)
+        const answer = await peerConnection.createAnswer()
         await peerConnection.setLocalDescription(answer)
         peerData.localDescriptionSet = true
         peerData.answerSent = true
@@ -858,51 +800,32 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       }
     } catch (error) {
       logDebug(`Error handling offer from ${userId}:`, error)
-      connectionStatusRef.current[userId] = "failed"
     }
   }
 
   const handleAnswer = async (userId, answer) => {
     try {
       const peerData = peerConnectionsRef.current[userId]
+      if (!peerData || peerData.connection.signalingState !== "have-local-offer") return
 
-      if (!peerData) {
-        logDebug(`No peer data found for ${userId}`)
-        return
-      }
-
-      const peerConnection = peerData.connection
-
-      if (peerConnection.signalingState !== "have-local-offer") {
-        logDebug(`Invalid signaling state for answer: ${peerConnection.signalingState}`)
-        return
-      }
-
-      logDebug(`Processing answer from ${userId}, signaling state: ${peerConnection.signalingState}`)
-
-      await peerConnection.setRemoteDescription(new RTCSessionDescription(answer))
+      await peerData.connection.setRemoteDescription(new RTCSessionDescription(answer))
       peerData.remoteDescriptionSet = true
 
-      logDebug(`Answer processed successfully for ${userId}`)
-
-      if (iceCandidateBuffersRef.current[userId] && iceCandidateBuffersRef.current[userId].length > 0) {
-        logDebug(`Processing ${iceCandidateBuffersRef.current[userId].length} buffered ICE candidates for ${userId}`)
-
+      // Process buffered ICE candidates
+      if (iceCandidateBuffersRef.current[userId]?.length > 0) {
         const candidates = [...iceCandidateBuffersRef.current[userId]]
         iceCandidateBuffersRef.current[userId] = []
 
         for (const candidate of candidates) {
           try {
-            await peerConnection.addIceCandidate(new RTCIceCandidate(candidate))
-            logDebug(`Added buffered ICE candidate for ${userId}`)
+            await peerData.connection.addIceCandidate(new RTCIceCandidate(candidate))
           } catch (e) {
-            logDebug(`Error adding buffered ICE candidate for ${userId}:`, e)
+            logDebug(`Error adding buffered ICE candidate:`, e)
           }
         }
       }
     } catch (error) {
       logDebug(`Error handling answer from ${userId}:`, error)
-      connectionStatusRef.current[userId] = "failed"
     }
   }
 
@@ -911,8 +834,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       const peerData = peerConnectionsRef.current[userId]
 
       if (!peerData) {
-        logDebug(`No peer data found for ${userId}, buffering ICE candidate`)
-
         if (!iceCandidateBuffersRef.current[userId]) {
           iceCandidateBuffersRef.current[userId] = []
         }
@@ -922,10 +843,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
       if (peerData.remoteDescriptionSet) {
         await peerData.connection.addIceCandidate(new RTCIceCandidate(candidate))
-        logDebug(`Added ICE candidate for ${userId}`)
       } else {
-        logDebug(`Remote description not set for ${userId}, buffering ICE candidate`)
-
         if (!iceCandidateBuffersRef.current[userId]) {
           iceCandidateBuffersRef.current[userId] = []
         }
@@ -943,15 +861,23 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       } catch (error) {
         logDebug(`Error closing peer connection for ${userId}:`, error)
       }
+
       delete peerConnectionsRef.current[userId]
       delete audioSendersRef.current[userId]
       delete videoSendersRef.current[userId]
       delete iceCandidateBuffersRef.current[userId]
-      delete forwardingStreamsRef.current[userId]
+      delete remoteStreamsMapRef.current[userId]
 
-      if (forwardedTracksRef.current[userId]) {
-        delete forwardedTracksRef.current[userId]
+      // Clean up forwarding references
+      if (forwardedStreamsRef.current[userId]) {
+        delete forwardedStreamsRef.current[userId]
       }
+
+      Object.keys(forwardedStreamsRef.current).forEach((targetUserId) => {
+        if (forwardedStreamsRef.current[targetUserId]) {
+          forwardedStreamsRef.current[targetUserId].delete(userId)
+        }
+      })
 
       setRemoteStreams((prev) => {
         const newStreams = { ...prev }
@@ -968,6 +894,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       if (remoteVideosRef.current[userId]) {
         const videoElement = remoteVideosRef.current[userId]
         if (videoElement.srcObject) {
+          videoElement.srcObject.getTracks().forEach((track) => track.stop())
           videoElement.srcObject = null
         }
         delete remoteVideosRef.current[userId]
@@ -982,8 +909,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
     const newAudioState = !isAudioEnabled
 
-    const audioTracks = localStreamRef.current.getAudioTracks()
-    audioTracks.forEach((track) => {
+    localStreamRef.current.getAudioTracks().forEach((track) => {
       track.enabled = newAudioState
     })
 
@@ -1012,9 +938,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     if (!localStreamRef.current || call.callType !== "video") return
 
     const newVideoState = !isVideoEnabled
-    const videoTracks = localStreamRef.current.getVideoTracks()
-
-    videoTracks.forEach((track) => {
+    localStreamRef.current.getVideoTracks().forEach((track) => {
       track.enabled = newVideoState
     })
 
@@ -1054,17 +978,17 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       clearTimeout(timeout)
     })
 
+    // Reset all refs
     peerConnectionsRef.current = {}
     audioSendersRef.current = {}
     videoSendersRef.current = {}
     iceCandidateBuffersRef.current = {}
-    forwardingStreamsRef.current = {}
-    forwardedTracksRef.current = {}
+    remoteStreamsMapRef.current = {}
+    forwardedStreamsRef.current = {}
     processedParticipantsRef.current.clear()
     participantsMapRef.current.clear()
     connectionTimersRef.current = {}
     reconnectAttemptsRef.current = {}
-    connectionEstablishedRef.current = {}
     connectionStatusRef.current = {}
     localStreamRef.current = null
     isHubRef.current = false
@@ -1085,6 +1009,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
     try {
       if (videoElement.srcObject) {
+        videoElement.srcObject.getTracks().forEach((track) => track.stop())
         videoElement.srcObject = null
       }
 
@@ -1096,50 +1021,77 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
       const playPromise = videoElement.play()
       if (playPromise !== undefined) {
-        playPromise
-          .then(() => {
-            logDebug(`Remote video playing for ${userId}`)
-          })
-          .catch((error) => {
-            logDebug(`Play failed for ${userId}, will retry on user interaction:`, error.name)
-
-            const retryPlay = () => {
-              videoElement.play().catch(console.error)
-              document.removeEventListener("click", retryPlay)
-            }
-            document.addEventListener("click", retryPlay, { once: true })
-          })
+        playPromise.catch((error) => {
+          const retryPlay = () => {
+            videoElement.play().catch(console.error)
+            document.removeEventListener("click", retryPlay)
+          }
+          document.addEventListener("click", retryPlay, { once: true })
+        })
       }
     } catch (error) {
       logDebug(`Error setting up video element for ${userId}:`, error)
     }
   }
 
-  const renderRemoteVideos = () => {
-    return Object.keys(remoteStreams).map((userId) => {
-      const userState = remoteUserStates[userId] || { audio: true, video: true }
-      const userInfo = peerConnectionsRef.current[userId]?.userInfo ||
-        participantsMapRef.current.get(userId) ||
-        connectedUsers.find((u) => u._id === userId || u.id === userId) || { name: "User", id: userId }
+  const renderAllVideos = () => {
+    const allStreams = []
 
-      const connectionState = connectionStatusRef.current[userId] || "unknown"
+    // Add local stream
+    allStreams.push({
+      userId: user.id,
+      stream: localStreamRef.current,
+      userInfo: user,
+      isLocal: true,
+      userState: { audio: isAudioEnabled, video: isVideoEnabled },
+    })
+
+    // Add all remote streams
+    Object.keys(remoteStreams).forEach((userId) => {
+      if (userId !== user.id) {
+        allStreams.push({
+          userId,
+          stream: remoteStreams[userId],
+          userInfo: peerConnectionsRef.current[userId]?.userInfo ||
+            participantsMapRef.current.get(userId) ||
+            connectedUsers.find((u) => u._id === userId || u.id === userId) || { name: "User", id: userId },
+          isLocal: false,
+          userState: remoteUserStates[userId] || { audio: true, video: call.callType === "video" },
+        })
+      }
+    })
+
+    return allStreams.map(({ userId, stream, userInfo, isLocal, userState }) => {
+      const connectionState = isLocal ? "connected" : connectionStatusRef.current[userId] || "unknown"
 
       return (
         <div key={userId} className="relative rounded-lg overflow-hidden bg-gray-800 flex items-center justify-center">
           <video
             ref={(el) => {
               if (el) {
-                remoteVideosRef.current[userId] = el
-                const stream = remoteStreams[userId]
-                if (stream) {
-                  setTimeout(() => {
-                    setupVideoElement(userId, stream)
-                  }, 100)
+                if (isLocal) {
+                  if (localVideoRef.current !== el) {
+                    localVideoRef.current = el
+                    if (stream) {
+                      el.srcObject = stream
+                      el.muted = true
+                      el.playsInline = true
+                      el.autoplay = true
+                    }
+                  }
+                } else {
+                  remoteVideosRef.current[userId] = el
+                  if (stream) {
+                    setTimeout(() => {
+                      setupVideoElement(userId, stream)
+                    }, 100)
+                  }
                 }
               }
             }}
             autoPlay
             playsInline
+            muted={isLocal}
             className={`w-full h-full object-cover ${call.callType === "audio" || !userState.video ? "hidden" : ""}`}
           />
 
@@ -1152,9 +1104,10 @@ export function CallInterface({ call, user, socket, onEndCall }) {
           )}
 
           <div className="absolute bottom-2 left-2 text-white text-sm bg-black bg-opacity-50 px-2 py-1 rounded flex items-center">
-            {userInfo.name || "User"}
+            {isLocal ? "You" : userInfo.name || "User"}
             {!userState.audio && <span className="ml-1">(Muted)</span>}
             {call.isGroupCall && userId === hubUserIdRef.current && <span className="ml-1 text-yellow-300">(Hub)</span>}
+            {isLocal && <span className="ml-1 text-green-300">(You)</span>}
           </div>
 
           {!userState.video && call.callType === "video" && (
@@ -1180,12 +1133,11 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
   return (
     <div className="h-screen flex flex-col bg-gray-900">
-      {/* Call header */}
       <div className="bg-gray-800 p-4 text-white flex items-center justify-between">
         <div>
           <h2 className="text-lg font-semibold">
             {call.isGroupCall
-              ? `Group ${call.callType} call`
+              ? `Group ${call.callType} call (SFU)`
               : `${call.callType.charAt(0).toUpperCase() + call.callType.slice(1)} call with ${
                   call.caller.id === user.id ? call.receiver?.name : call.caller.name
                 }`}
@@ -1207,50 +1159,17 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         </div>
       </div>
 
-      {/* Call content */}
       <div className="flex-1 p-2 flex flex-col overflow-hidden">
-        {/* Video grid */}
         <div
-          ref={containerRef}
           className={`flex-1 grid gap-2 ${gridLayout} overflow-hidden`}
           style={{
             gridAutoRows: "1fr",
             maxHeight: "calc(100vh - 160px)",
           }}
         >
-          {/* Remote videos */}
-          {renderRemoteVideos()}
-
-          {/* Local video */}
-          <div className="relative rounded-lg overflow-hidden bg-gray-800 flex items-center justify-center">
-            <video
-              ref={localVideoRef}
-              autoPlay
-              playsInline
-              muted
-              className={`w-full h-full object-cover ${call.callType === "audio" || !isVideoEnabled ? "hidden" : ""}`}
-            />
-
-            {(call.callType === "audio" || !isVideoEnabled) && (
-              <div className="absolute inset-0 flex items-center justify-center bg-gray-800">
-                <div className="w-16 h-16 bg-blue-500 text-white rounded-full flex items-center justify-center text-xl font-bold">
-                  {user.name.charAt(0).toUpperCase()}
-                </div>
-              </div>
-            )}
-
-            <div className="absolute bottom-2 left-2 text-white text-sm bg-black bg-opacity-50 px-2 py-1 rounded">
-              You {!isAudioEnabled && "(Muted)"}
-              {call.isGroupCall && isHubRef.current && <span className="text-yellow-300 ml-1">(Hub)</span>}
-            </div>
-
-            {!isVideoEnabled && call.callType === "video" && (
-              <div className="absolute top-2 right-2 text-white text-xs bg-red-500 px-2 py-1 rounded">Video Off</div>
-            )}
-          </div>
+          {renderAllVideos()}
         </div>
 
-        {/* Call controls */}
         <div className="mt-4 flex justify-center gap-4">
           <button
             onClick={toggleAudio}
@@ -1281,6 +1200,16 @@ export function CallInterface({ call, user, socket, onEndCall }) {
           >
             <PhoneOff className="w-6 h-6" />
           </button>
+        </div>
+      </div>
+
+      {/* Debug panel - shows current state */}
+      <div className="bg-gray-700 p-2 text-xs text-gray-300">
+        <div>
+          Hub: {hubUserIdRef.current} | Am Hub: {isHubRef.current ? "Yes" : "No"} | Connections: {Object.keys(peerConnectionsRef.current).length} | Remote Streams: {Object.keys(remoteStreams).length}
+        </div>
+        <div>
+          SFU Model: Each participant → Hub → All participants (Complete Grid) | Forwarded: {JSON.stringify(Object.fromEntries(Object.entries(forwardedStreamsRef.current).map(([key, value]) => [key, Array.from(value || [])])))}
         </div>
       </div>
     </div>
