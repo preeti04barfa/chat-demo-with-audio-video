@@ -1,4 +1,3 @@
-"use client"
 
 export function UsersList({ users, currentChatUser, onUserSelect }) {
   const formatLastSeen = (lastSeen) => {

@@ -37,7 +37,7 @@ export function GroupChat({
             <h2 className="text-lg font-semibold">{group.name}</h2>
             <div className="text-sm text-gray-500">
               {group.members ? group.members.length : 0} members
-              {isCallActive && <span className="text-green-600 font-medium ml-2">• Call Active</span>}
+              {isCallActive && <span className="text-green-600 font-medium ml-2">• Call Active (SFU)</span>}
             </div>
           </div>
 
@@ -56,14 +56,14 @@ export function GroupChat({
                 <button
                   onClick={onAudioCall}
                   className="p-2 rounded-full hover:bg-gray-100 transition-colors"
-                  title="Group Audio Call"
+                  title="Group Audio Call (SFU)"
                 >
                   <Phone className="w-5 h-5 text-blue-600" />
                 </button>
                 <button
                   onClick={onVideoCall}
                   className="p-2 rounded-full hover:bg-gray-100 transition-colors"
-                  title="Group Video Call"
+                  title="Group Video Call (SFU)"
                 >
                   <Video className="w-5 h-5 text-blue-600" />
                 </button>
