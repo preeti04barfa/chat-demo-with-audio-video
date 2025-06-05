@@ -1,4 +1,3 @@
-
 import { useEffect, useRef, useState, useCallback } from "react"
 import { PhoneOff, Mic, MicOff, Video, VideoOff, Users } from "lucide-react"
 
@@ -10,7 +9,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
   const audioSendersRef = useRef({})
   const videoSendersRef = useRef({})
 
-  // SFU-specific refs
   const isHubRef = useRef(false)
   const hubUserIdRef = useRef(null)
   const remoteStreamsMapRef = useRef({})
@@ -21,8 +19,7 @@ export function CallInterface({ call, user, socket, onEndCall }) {
   const processedParticipantsRef = useRef(new Set())
   const participantsMapRef = useRef(new Map())
 
-  // Track which streams have been forwarded to which users
-  const forwardedStreamsRef = useRef({}) // {targetUserId: Set<sourceUserId>}
+  const forwardedStreamsRef = useRef({}) 
 
   const [isAudioEnabled, setIsAudioEnabled] = useState(true)
   const [isVideoEnabled, setIsVideoEnabled] = useState(call.callType === "video")
@@ -32,13 +29,11 @@ export function CallInterface({ call, user, socket, onEndCall }) {
   const [remoteUserStates, setRemoteUserStates] = useState({})
   const [gridLayout, setGridLayout] = useState("grid-cols-1")
 
-  // Logging function
   const logDebug = useCallback((message, data = null) => {
     const timestamp = new Date().toISOString().split("T")[1].split(".")[0]
     console.log(`[SFU ${timestamp}] ${message}`, data || "")
   }, [])
 
-  // Calculate grid layout
   useEffect(() => {
     const totalParticipants = Object.keys(remoteStreams).length + 1
 
@@ -59,9 +54,8 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     }
   }, [remoteStreams])
 
-  // Initialize call
   useEffect(() => {
-    // Reset all state
+    // Resett state
     forwardedStreamsRef.current = {}
     remoteStreamsMapRef.current = {}
     iceCandidateBuffersRef.current = {}
@@ -78,7 +72,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     }
   }, [])
 
-  // Periodic forwarding check for hub - CRITICAL for ensuring all streams are forwarded
   useEffect(() => {
     if (!call.isGroupCall) return
 
@@ -86,12 +79,11 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       if (isHubRef.current) {
         ensureAllStreamsForwarded()
       }
-    }, 2000) // Check every 2 seconds
+    }, 2000)
 
     return () => clearInterval(interval)
   }, [call.isGroupCall])
 
-  // Socket event listeners
   useEffect(() => {
     if (!socket) return
 
@@ -172,7 +164,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
       if (isHubRef.current) {
         logDebug("I am the hub for this group call")
-        // Reset forwarding state
         forwardedStreamsRef.current = {}
 
         setTimeout(() => {
@@ -181,7 +172,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       } else {
         logDebug(`Connecting to hub: ${hubUserId}`)
 
-        // Clean up connections to non-hub users
         Object.keys(peerConnectionsRef.current).forEach((userId) => {
           if (userId !== hubUserId) {
             cleanupPeerConnection(userId)
@@ -410,7 +400,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     }
   }
 
-  // IMPROVED: Core SFU forwarding function - ensures streams reach all participants
   const forwardStreamToParticipant = (sourceUserId, targetUserId, stream) => {
     if (!isHubRef.current || sourceUserId === targetUserId) return false
 
@@ -420,12 +409,10 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       return false
     }
 
-    // Initialize forwarding tracking for target
     if (!forwardedStreamsRef.current[targetUserId]) {
       forwardedStreamsRef.current[targetUserId] = new Set()
     }
 
-    // Check if already forwarded
     if (forwardedStreamsRef.current[targetUserId].has(sourceUserId)) {
       logDebug(`Stream from ${sourceUserId} already forwarded to ${targetUserId}`)
       return true
@@ -438,13 +425,9 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
       stream.getTracks().forEach((track) => {
         try {
-          // Clone the track to avoid conflicts
           const clonedTrack = track.clone()
-          
-          // Create a new stream for this forwarded track
           const forwardedStream = new MediaStream([clonedTrack])
           
-          // Add track to peer connection
           targetPeer.connection.addTrack(clonedTrack, forwardedStream)
           tracksAdded++
           logDebug(`Added ${track.kind} track from ${sourceUserId} to ${targetUserId}`)
@@ -465,16 +448,13 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     return false
   }
 
-  // IMPROVED: Critical function to ensure all streams are forwarded to all participants
   const ensureAllStreamsForwarded = () => {
     if (!isHubRef.current) return
 
     logDebug("Hub ensuring all streams are forwarded to all participants")
 
-    // Get all connected participants (excluding hub itself)
     const allParticipants = Object.keys(peerConnectionsRef.current).filter(id => id !== user.id)
 
-    // Get all available streams (including hub's own stream)
     const allStreams = { ...remoteStreamsMapRef.current }
     if (localStreamRef.current) {
       allStreams[user.id] = localStreamRef.current
@@ -482,11 +462,9 @@ export function CallInterface({ call, user, socket, onEndCall }) {
 
     logDebug(`Hub has ${Object.keys(allStreams).length} streams to forward to ${allParticipants.length} participants`)
 
-    // For each participant, ensure they receive ALL streams
     allParticipants.forEach((targetUserId) => {
       logDebug(`Ensuring participant ${targetUserId} receives all streams`)
       
-      // For each stream, ensure it's forwarded to this participant
       Object.entries(allStreams).forEach(([sourceUserId, stream]) => {
         if (sourceUserId !== targetUserId && stream) {
           const success = forwardStreamToParticipant(sourceUserId, targetUserId, stream)
@@ -499,7 +477,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       })
     })
 
-    // Log current forwarding status
     logDebug("Current forwarding status:", {
       totalStreams: Object.keys(allStreams).length,
       totalParticipants: allParticipants.length,
@@ -566,7 +543,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         })
       }
 
-      // IMPROVED: Handle incoming tracks - crucial for participants to receive forwarded streams
       peerConnection.ontrack = (event) => {
         logDebug(`Received track from ${userId}`, event)
         const [remoteStream] = event.streams
@@ -593,11 +569,9 @@ export function CallInterface({ call, user, socket, onEndCall }) {
             },
           }))
 
-          // If this is the hub receiving a stream, forward it to ALL other participants
           if (call.isGroupCall && isHubRef.current) {
             logDebug(`Hub received stream from ${userId}, forwarding to all other participants`)
 
-            // Immediately forward this stream to all other connected participants
             setTimeout(() => {
               Object.keys(peerConnectionsRef.current).forEach((targetUserId) => {
                 if (targetUserId !== userId && targetUserId !== user.id) {
@@ -605,7 +579,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
                 }
               })
 
-              // Also ensure all existing streams are forwarded to this new participant
               if (localStreamRef.current) {
                 forwardStreamToParticipant(user.id, userId, localStreamRef.current)
               }
@@ -639,7 +612,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         if (peerConnection.iceConnectionState === "connected" || peerConnection.iceConnectionState === "completed") {
           reconnectAttemptsRef.current[userId] = 0
 
-          // Process buffered ICE candidates
           if (iceCandidateBuffersRef.current[userId]?.length > 0) {
             const candidates = [...iceCandidateBuffersRef.current[userId]]
             iceCandidateBuffersRef.current[userId] = []
@@ -653,7 +625,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
             })
           }
 
-          // CRITICAL: If hub, ensure ALL streams are forwarded after connection is established
           if (call.isGroupCall && isHubRef.current) {
             setTimeout(() => {
               logDebug(`Connection established with ${userId}, ensuring all streams forwarded`)
@@ -682,7 +653,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         }
       }
 
-      // Determine who should initiate the offer
       if (call.isGroupCall) {
         shouldInitiateOffer = isHubRef.current
       } else {
@@ -707,7 +677,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
     }
   }
 
-  // ... keep existing code (createOffer, handleOffer, handleAnswer, handleIceCandidate, cleanupPeerConnection, toggleAudio, toggleVideo, cleanup, formatDuration, setupVideoElement functions)
 
   const createOffer = async (userId, peerConnection) => {
     try {
@@ -770,7 +739,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       await peerConnection.setRemoteDescription(new RTCSessionDescription(offer))
       peerData.remoteDescriptionSet = true
 
-      // Process buffered ICE candidates
       if (iceCandidateBuffersRef.current[userId]?.length > 0) {
         const candidates = [...iceCandidateBuffersRef.current[userId]]
         iceCandidateBuffersRef.current[userId] = []
@@ -811,7 +779,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       await peerData.connection.setRemoteDescription(new RTCSessionDescription(answer))
       peerData.remoteDescriptionSet = true
 
-      // Process buffered ICE candidates
       if (iceCandidateBuffersRef.current[userId]?.length > 0) {
         const candidates = [...iceCandidateBuffersRef.current[userId]]
         iceCandidateBuffersRef.current[userId] = []
@@ -868,7 +835,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       delete iceCandidateBuffersRef.current[userId]
       delete remoteStreamsMapRef.current[userId]
 
-      // Clean up forwarding references
       if (forwardedStreamsRef.current[userId]) {
         delete forwardedStreamsRef.current[userId]
       }
@@ -1037,7 +1003,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
   const renderAllVideos = () => {
     const allStreams = []
 
-    // Add local stream
     allStreams.push({
       userId: user.id,
       stream: localStreamRef.current,
@@ -1046,7 +1011,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
       userState: { audio: isAudioEnabled, video: isVideoEnabled },
     })
 
-    // Add all remote streams
     Object.keys(remoteStreams).forEach((userId) => {
       if (userId !== user.id) {
         allStreams.push({
@@ -1203,7 +1167,6 @@ export function CallInterface({ call, user, socket, onEndCall }) {
         </div>
       </div>
 
-      {/* Debug panel - shows current state */}
       <div className="bg-gray-700 p-2 text-xs text-gray-300">
         <div>
           Hub: {hubUserIdRef.current} | Am Hub: {isHubRef.current ? "Yes" : "No"} | Connections: {Object.keys(peerConnectionsRef.current).length} | Remote Streams: {Object.keys(remoteStreams).length}
